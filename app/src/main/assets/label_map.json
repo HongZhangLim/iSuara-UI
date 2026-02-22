@@ -313,9 +313,9 @@
       "Stage 3: Velocity (1st derivative, +258 → 516)",
       "Stage 4: Acceleration (2nd derivative, +258 → 774)",
       "Stage 5: Engineered features (+6 → 780)",
-      "Stage 6: Z-score (BAKED INTO MODEL — no external scaler needed!)"
+      "Stage 6: Z-score (BAKED INTO MODEL ─ no external scaler needed!)"
     ],
     "note": "Apply stages 1-5 externally. Stage 6 is inside the TFLite model.",
-    "input_to_model": "(1, 30, 780) float32 — stages 1-5 applied, NO z-score needed"
+    "input_to_model": "(1, 30, 780) float32 ─ stages 1-5 applied, NO z-score needed"
   }
 }

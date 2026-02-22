@@ -34,21 +34,40 @@ class SignInterpreter(context: Context) {
 
     init {
         val model = loadModelFile(context)
-        val options = Interpreter.Options().apply {
-            numThreads = 4
-        }
+        var tempInterpreter: Interpreter? = null
 
-        // Try GPU delegate (most compatible with dynamic-range quantized LSTMs)
+        // Attempt 1: Try with GPU Delegate
         try {
-            gpuDelegate = GpuDelegate()
-            options.addDelegate(gpuDelegate!!)
-            Log.i(TAG, "Using GPU delegate")
-        } catch (e: Exception) {
-            Log.w(TAG, "GPU delegate unavailable, using CPU: ${e.message}")
+            // Check if the device actually supports the GPU delegate
+            val compatList = org.tensorflow.lite.gpu.CompatibilityList()
+
+            if (compatList.isDelegateSupportedOnThisDevice) {
+                // Gets the optimal, non-deprecated Options for this specific phone
+                val delegateOptions = compatList.bestOptionsForThisDevice
+                gpuDelegate = GpuDelegate(delegateOptions)
+
+                val gpuOptions = Interpreter.Options().apply { numThreads = 4 }
+                gpuOptions.addDelegate(gpuDelegate!!)
+
+                tempInterpreter = Interpreter(model, gpuOptions)
+                Log.i(TAG, "Using GPU delegate")
+            } else {
+                Log.w(TAG, "GPU not supported on this device. Skipping to CPU fallback.")
+            }
+        } catch (e: Throwable) {
+            Log.w(TAG, "GPU delegate failed or rejected the model. Falling back to CPU: ${e.message}")
+            gpuDelegate?.close()
             gpuDelegate = null
         }
 
-        interpreter = Interpreter(model, options)
+        // Attempt 2: Fallback to CPU
+        if (tempInterpreter == null) {
+            val cpuOptions = Interpreter.Options().apply { numThreads = 4 }
+            tempInterpreter = Interpreter(model, cpuOptions)
+            Log.i(TAG, "Using CPU delegate fallback")
+        }
+
+        interpreter = tempInterpreter
         Log.i(TAG, "Model loaded: $MODEL_FILE")
 
         // Validate shapes

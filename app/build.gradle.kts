@@ -40,8 +40,10 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        }
     }
 
     buildFeatures {
@@ -85,9 +87,11 @@ dependencies {
 
     // TFLite — interpreter + delegates
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite-api:2.16.1")
     implementation("org.tensorflow:tensorflow-lite-support:0.4.4")
     implementation("org.tensorflow:tensorflow-lite-gpu:2.16.1")
     implementation("org.tensorflow:tensorflow-lite-select-tf-ops:2.16.1")
+    implementation("org.tensorflow:tensorflow-lite-gpu-api:2.16.1")
 
     // Gemini AI (Google Generative AI SDK)
     implementation("com.google.ai.client.generativeai:generativeai:0.9.0")
