@@ -3,159 +3,113 @@ package com.isuara.app.ml
 import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
-/**
- * SignPredictor — orchestrates the full ML pipeline:
- *   CameraFrame → LandmarkExtractor → FrameNormalizer → SignInterpreter
- *
- * Manages sliding window of 30 frames, cooldown, sentence buffer.
- * All processing runs on the caller's thread (CameraX executor).
- */
 class SignPredictor(context: Context) {
 
-    companion object {
-        private const val TAG = "SignPredictor"
-        private const val CONFIDENCE_THRESHOLD = 0.6f
-        private const val COOLDOWN_FRAMES = 10
-        private const val MAX_SENTENCE_WORDS = 8
-    }
-
-    // ── ML components ──
-    private val landmarkExtractor = LandmarkExtractor(context)
-    private val signInterpreter = SignInterpreter(context)
-    private val labels: List<String>
-
-    // ── Sliding window state ──
-    private val frameBuffer = ArrayDeque<FloatArray>(FrameNormalizer.SEQUENCE_LENGTH + 1)
-    private var cooldownCounter = 0
-
-    // ── Sentence state ──
-    private val sentenceWords = mutableListOf<String>()
-    private var lastWord = ""
-
-    // ── Observable state for UI ──
     data class PredictionState(
         val currentWord: String = "",
         val confidence: Float = 0f,
         val isConfident: Boolean = false,
         val bufferProgress: Float = 0f,
-        val sentence: List<String> = emptyList()
+        val sentence: List<String> = emptyList(),
+        val keypoints: FloatArray? = null,
+        val imageWidth: Int = 480,  // PINPOINT: Fixes "No parameter found"
+        val imageHeight: Int = 640  // PINPOINT: Fixes "No parameter found"
     )
+
+    private val landmarkExtractor = LandmarkExtractor(context, this::onLandmarksExtracted)
+    private val signInterpreter = SignInterpreter(context)
+    private val labels: List<String>
+    private val inferenceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    private val isPredicting = AtomicBoolean(false)
+    private val cooldownCounter = AtomicInteger(0)
+    private val frameBuffer = ArrayDeque<FloatArray>(31)
+    private val sentenceWords = mutableListOf<String>()
+    private var lastWord = ""
 
     private val _state = MutableStateFlow(PredictionState())
     val state: StateFlow<PredictionState> = _state.asStateFlow()
 
     init {
-        // Load label map
-        val jsonStr = context.assets.open("label_map.json")
-            .bufferedReader().use { it.readText() }
-        val json = JSONObject(jsonStr)
-        val arr = json.getJSONArray("actions_ordered")
-        labels = (0 until arr.length()).map { arr.getString(it) }
-        Log.i(TAG, "Loaded ${labels.size} labels")
+        val jsonStr = context.assets.open("label_map.json").bufferedReader().use { it.readText() }
+        labels = JSONObject(jsonStr).getJSONArray("actions_ordered").let { arr ->
+            (0 until arr.length()).map { arr.getString(it) }
+        }
     }
 
-    /**
-     * Process one camera frame. Call from CameraX analysis thread.
-     *
-     * @param bitmap ARGB_8888 camera frame
-     * @param timestampMs frame timestamp in ms
-     */
     fun processFrame(bitmap: Bitmap, timestampMs: Long) {
-        // ── Stage 0: Extract landmarks ──
-        val rawKeypoints = landmarkExtractor.extract(bitmap, timestampMs)
-        if (rawKeypoints == null) {
-            updateProgress()
-            return
-        }
+        // Update dimensions immediately for the UI mapping
+        _state.update { it.copy(imageWidth = bitmap.width, imageHeight = bitmap.height) }
+        landmarkExtractor.extractAsync(bitmap, timestampMs)
+    }
 
-        // ── Stages 1+2: Anchor + Scale normalization ──
+    private fun onLandmarksExtracted(rawKeypoints: FloatArray?, timestampMs: Long) {
+        _state.update { it.copy(keypoints = rawKeypoints) }
+        if (rawKeypoints == null) return
+
         val normalized = FrameNormalizer.normalizeSingleFrame(rawKeypoints)
-        frameBuffer.addLast(normalized)
-        if (frameBuffer.size > FrameNormalizer.SEQUENCE_LENGTH) {
-            frameBuffer.removeFirst()
-        }
+        synchronized(frameBuffer) {
+            frameBuffer.addLast(normalized)
+            if (frameBuffer.size > 30) frameBuffer.removeFirst()
 
-        // ── Predict when buffer full and not in cooldown ──
-        if (frameBuffer.size == FrameNormalizer.SEQUENCE_LENGTH && cooldownCounter <= 0) {
-            // Stages 3+4+5: Velocity, Acceleration, Engineered
-            val sequence = frameBuffer.toTypedArray()
-            val features = FrameNormalizer.buildSequenceFeatures(sequence)
-
-            // Stage 6 (z-score) is baked into the model
-            val (predIdx, confidence) = signInterpreter.predictTopClass(features)
-
-            if (confidence >= CONFIDENCE_THRESHOLD) {
-                val word = labels[predIdx]
-
-                // Add to sentence (skip consecutive duplicates and Idle)
-                if (word != lastWord && word != "Idle") {
-                    sentenceWords.add(word)
-                    lastWord = word
-                    if (sentenceWords.size > MAX_SENTENCE_WORDS) {
-                        sentenceWords.removeAt(0)
+            if (frameBuffer.size == 30 && cooldownCounter.get() <= 0 && isPredicting.compareAndSet(false, true)) {
+                val sequence = frameBuffer.toTypedArray()
+                inferenceScope.launch {
+                    try {
+                        val features = FrameNormalizer.buildSequenceFeatures(sequence)
+                        val (idx, conf) = signInterpreter.predictTopClass(features)
+                        updatePrediction(labels[idx], conf)
+                    } finally {
+                        isPredicting.set(false)
                     }
                 }
-
-                _state.value = PredictionState(
-                    currentWord = word,
-                    confidence = confidence,
-                    isConfident = true,
-                    bufferProgress = 1f,
-                    sentence = sentenceWords.toList()
-                )
-                cooldownCounter = COOLDOWN_FRAMES
-            } else {
-                _state.value = PredictionState(
-                    currentWord = "${labels[predIdx]}?",
-                    confidence = confidence,
-                    isConfident = false,
-                    bufferProgress = 1f,
-                    sentence = sentenceWords.toList()
-                )
-                cooldownCounter = COOLDOWN_FRAMES / 2
+            } else if (cooldownCounter.get() > 0) {
+                cooldownCounter.decrementAndGet()
             }
-        } else {
-            if (cooldownCounter > 0) cooldownCounter--
             updateProgress()
         }
+    }
+
+    private fun updatePrediction(word: String, confidence: Float) {
+        val isConfident = confidence >= 0.6f
+        if (isConfident && word != lastWord && word != "Idle") {
+            sentenceWords.add(word)
+            lastWord = word
+            if (sentenceWords.size > 8) sentenceWords.removeAt(0)
+        }
+        _state.update { it.copy(
+            currentWord = if (isConfident) word else "$word?",
+            confidence = confidence,
+            isConfident = isConfident,
+            sentence = sentenceWords.toList(),
+            bufferProgress = 1f
+        ) }
+        cooldownCounter.set(if (isConfident) 10 else 5)
     }
 
     private fun updateProgress() {
-        val prev = _state.value
-        val progress = frameBuffer.size.toFloat() / FrameNormalizer.SEQUENCE_LENGTH
-        if (progress != prev.bufferProgress) {
-            _state.value = prev.copy(bufferProgress = progress)
-        }
+        val progress = synchronized(frameBuffer) { frameBuffer.size.toFloat() / 30 }
+        _state.update { it.copy(bufferProgress = progress) }
     }
 
-    fun getSentenceWords(): List<String> = sentenceWords.toList()
-
-    fun resetBuffer() {
-        frameBuffer.clear()
-        cooldownCounter = 0
-        _state.value = _state.value.copy(
-            currentWord = "",
-            confidence = 0f,
-            bufferProgress = 0f
-        )
-    }
-
-    fun resetSentence() {
+    fun getSentenceWords() = sentenceWords.toList()
+    fun resetAll() {
+        synchronized(frameBuffer) { frameBuffer.clear() }
         sentenceWords.clear()
         lastWord = ""
-        _state.value = _state.value.copy(sentence = emptyList())
+        _state.update { PredictionState() }
     }
-
-    fun resetAll() {
-        resetBuffer()
-        resetSentence()
-    }
-
     fun close() {
         landmarkExtractor.close()
         signInterpreter.close()

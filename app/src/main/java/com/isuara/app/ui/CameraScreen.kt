@@ -23,6 +23,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
@@ -55,70 +56,138 @@ fun CameraScreen(
     val predictionState by signPredictor.state.collectAsState()
 
     // ── Local UI state ──
+    var showLandmarks by remember { mutableStateOf(false) }
     var translatedText by remember { mutableStateOf("") }
     var isTranslating by remember { mutableStateOf(false) }
     var fpsCounter by remember { mutableIntStateOf(0) }
     var displayFps by remember { mutableIntStateOf(0) }
     var lastFpsTime by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    var lensFacing by remember { mutableIntStateOf(CameraSelector.LENS_FACING_FRONT) }
 
     // ── Camera executor (single thread for ML) ──
     val mlExecutor = remember { Executors.newSingleThreadExecutor() }
 
     Box(modifier = Modifier.fillMaxSize()) {
         // ══════════════════════════════════════════
-        // Camera Preview (full screen, behind everything)
+        // Camera Preview Setup (LaunchedEffect + AndroidView)
         // ══════════════════════════════════════════
-        AndroidView(
-            factory = { ctx ->
-                val previewView = PreviewView(ctx).apply {
-                    scaleType = PreviewView.ScaleType.FILL_CENTER
-                    implementationMode = PreviewView.ImplementationMode.PERFORMANCE
+
+        // 1. Create the physical view exactly once
+        val previewView = remember {
+            androidx.camera.view.PreviewView(context).apply {
+                scaleType = androidx.camera.view.PreviewView.ScaleType.FILL_CENTER
+                implementationMode = androidx.camera.view.PreviewView.ImplementationMode.PERFORMANCE
+            }
+        }
+
+        // 2. Re-bind the camera ONLY when 'lensFacing' changes
+        LaunchedEffect(lensFacing) {
+            val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
+            cameraProviderFuture.addListener({
+                val cameraProvider = cameraProviderFuture.get()
+
+                val preview = Preview.Builder()
+                    .build()
+                    .also { it.surfaceProvider = previewView.surfaceProvider }
+
+                val imageAnalysis = ImageAnalysis.Builder()
+                    .setTargetResolution(android.util.Size(640, 480))
+                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                    .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
+                    .build()
+
+                val isFront = lensFacing == CameraSelector.LENS_FACING_FRONT
+
+                imageAnalysis.setAnalyzer(mlExecutor) { imageProxy ->
+                    processImageProxy(imageProxy, signPredictor, isFront)
+
+                    // FPS tracking
+                    fpsCounter++
+                    val now = System.currentTimeMillis()
+                    if (now - lastFpsTime >= 1000) {
+                        displayFps = fpsCounter
+                        fpsCounter = 0
+                        lastFpsTime = now
+                    }
                 }
 
-                val cameraProviderFuture = ProcessCameraProvider.getInstance(ctx)
-                cameraProviderFuture.addListener({
-                    val cameraProvider = cameraProviderFuture.get()
+                val cameraSelector = CameraSelector.Builder().requireLensFacing(lensFacing).build()
 
-                    val preview = Preview.Builder()
-                        .build()
-                        .also { it.surfaceProvider = previewView.surfaceProvider }
+                try {
+                    cameraProvider.unbindAll() // Stop current camera
+                    cameraProvider.bindToLifecycle(
+                        lifecycleOwner,
+                        cameraSelector,    // Start new camera (Front or Back)
+                        preview,
+                        imageAnalysis
+                    )
+                } catch (e: Exception) {
+                    Log.e(TAG, "Camera bind failed", e)
+                }
+            }, ContextCompat.getMainExecutor(context))
+        }
 
-                    val imageAnalysis = ImageAnalysis.Builder()
-                        .setTargetResolution(android.util.Size(640, 480))
-                        .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                        .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                        .build()
-
-                    imageAnalysis.setAnalyzer(mlExecutor) { imageProxy ->
-                        processImageProxy(imageProxy, signPredictor)
-
-                        // FPS tracking
-                        fpsCounter++
-                        val now = System.currentTimeMillis()
-                        if (now - lastFpsTime >= 1000) {
-                            displayFps = fpsCounter
-                            fpsCounter = 0
-                            lastFpsTime = now
-                        }
-                    }
-
-                    try {
-                        cameraProvider.unbindAll()
-                        cameraProvider.bindToLifecycle(
-                            lifecycleOwner,
-                            CameraSelector.DEFAULT_FRONT_CAMERA,
-                            preview,
-                            imageAnalysis
-                        )
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Camera bind failed", e)
-                    }
-                }, ContextCompat.getMainExecutor(ctx))
-
-                previewView
-            },
+        // 3. Display the view on screen
+        AndroidView(
+            factory = { previewView },
             modifier = Modifier.fillMaxSize()
         )
+
+        if (showLandmarks && predictionState.keypoints != null) {
+            androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                val keypoints = predictionState.keypoints!!
+                val radius = 6f
+
+                // PINPOINT: These now reference the fields added to PredictionState
+                val imageWidth = predictionState.imageWidth.toFloat()
+                val imageHeight = predictionState.imageHeight.toFloat()
+
+                // 1. Calculate how much the preview scaled the image to fill the screen
+                val scale = java.lang.Math.max(size.width / imageWidth, size.height / imageHeight)
+                val scaledWidth = imageWidth * scale
+                val scaledHeight = imageHeight * scale
+
+                // 2. Calculate the crop offsets (how much was chopped off the sides/top)
+                val offsetX = (size.width - scaledWidth) / 2f
+                val offsetY = (size.height - scaledHeight) / 2f
+
+                // 3. Helper function to perfectly map MediaPipe [0..1] values to the screen
+                fun mapX(xNorm: Float): Float {
+                    // PINPOINT: Mirror the x-coordinate for the front camera
+                    // PreviewView mirrors the display, so we must mirror the landmark mapping
+                    return ((1f - xNorm) * scaledWidth) + offsetX
+                }
+
+                fun mapY(yNorm: Float) = (yNorm * scaledHeight) + offsetY
+
+                for (i in 0 until 33) {
+                    val x = mapX(keypoints[i * 4])
+                    val y = mapY(keypoints[i * 4 + 1])
+
+                    // PINPOINT: Use visibility threshold to prevent "ghost" dots
+                    val visibility = keypoints[i * 4 + 3]
+                    if (visibility > 0.5f) {
+                        drawCircle(Color.Green, radius, androidx.compose.ui.geometry.Offset(x, y))
+                    }
+                }
+
+                // 2. Left Hand (Magenta)
+                for (i in 0 until 21) {
+                    val idx = 132 + (i * 3)
+                    val x = mapX(keypoints[idx])
+                    val y = mapY(keypoints[idx + 1])
+                    if (keypoints[idx] > 0f) drawCircle(Color.Magenta, radius, androidx.compose.ui.geometry.Offset(x, y))
+                }
+
+                // 3. Right Hand (Cyan)
+                for (i in 0 until 21) {
+                    val idx = 195 + (i * 3)
+                    val x = mapX(keypoints[idx])
+                    val y = mapY(keypoints[idx + 1])
+                    if (keypoints[idx] > 0f) drawCircle(Color.Cyan, radius, androidx.compose.ui.geometry.Offset(x, y))
+                }
+            }
+        }
 
         // ══════════════════════════════════════════
         // Top overlay: current prediction + confidence
@@ -144,11 +213,33 @@ fun CameraScreen(
                     fontWeight = FontWeight.Bold
                 )
 
-                Text(
-                    text = "${displayFps} FPS",
-                    color = Color.White.copy(alpha = 0.7f),
-                    fontSize = 12.sp
-                )
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    IconButton(onClick = {
+                        lensFacing = if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
+                            CameraSelector.LENS_FACING_BACK
+                        } else {
+                            CameraSelector.LENS_FACING_FRONT
+                        }
+                    }) {
+                        Icon(
+                            imageVector = Icons.Default.Refresh,
+                            contentDescription = "Flip Camera",
+                            tint = Color.White
+                        )
+                    }
+                    Text("Dots", color = Color.White.copy(alpha = 0.8f), fontSize = 12.sp)
+                    Switch(
+                        checked = showLandmarks,
+                        onCheckedChange = { showLandmarks = it },
+                        modifier = Modifier.scale(0.7f) // Make switch smaller to fit top bar
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "${displayFps} FPS",
+                        color = Color.White.copy(alpha = 0.7f),
+                        fontSize = 12.sp
+                    )
+                }
             }
 
             // Buffer progress bar
@@ -310,20 +401,22 @@ fun CameraScreen(
  * Convert ImageProxy to Bitmap and feed to SignPredictor.
  * Runs on the ML executor thread.
  */
-private fun processImageProxy(imageProxy: ImageProxy, signPredictor: SignPredictor) {
+private fun processImageProxy(imageProxy: ImageProxy, signPredictor: SignPredictor, isFrontCamera: Boolean) {
     try {
         val bitmap = imageProxy.toBitmap()
+        val matrix = Matrix().apply {
+            // PINPOINT: Rotate the frame so the AI sees a standing person
+            postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+            if (isFrontCamera) {
+                postScale(-1f, 1f, bitmap.width / 2f, bitmap.height / 2f)
+            }
+        }
+        val processedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
 
-        // Front camera needs horizontal flip (mirror)
-        val matrix = Matrix().apply { postScale(-1f, 1f, bitmap.width / 2f, bitmap.height / 2f) }
-        val flipped = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+        signPredictor.processFrame(processedBitmap, imageProxy.imageInfo.timestamp / 1_000_000)
 
-        signPredictor.processFrame(flipped, imageProxy.imageInfo.timestamp / 1_000_000)
-
-        if (flipped !== bitmap) flipped.recycle()
+        if (processedBitmap !== bitmap) processedBitmap.recycle()
         bitmap.recycle()
-    } catch (e: Exception) {
-        Log.e(TAG, "Frame processing error", e)
     } finally {
         imageProxy.close()
     }
