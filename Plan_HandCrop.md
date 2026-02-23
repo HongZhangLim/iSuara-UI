@@ -1,110 +1,99 @@
-Here is the full, comprehensive plan for implementing the dynamic hand-cropping strategy (Step 4) in your Android application.
+## Plan: Dynamic Hand Crop Strategy (Hybrid)
 
-This plan involves splitting the hand landmarker into two separate instances (to fix hand-entanglement bugs), using the pose data to dynamically size and center a crop box, and remapping the coordinates back to the full frame.
+**TL;DR** — Replace full-frame hand detection with a dynamic-crop pipeline using **previous-frame pose caching** to maintain parallel execution. Each frame: pose and two hand detectors fire simultaneously — hand detectors use wrist coordinates cached from the prior frame's pose result to crop small regions. Crop size = `shoulderWidthPx × 1.5`, adapting to user distance. Two separate `HandLandmarker` instances (`numHands=1` each) eliminate hand-entanglement bugs. Cropped hand landmarks are remapped back to full-frame `[0..1]` space before merging into the 258-float feature array. No changes to `FrameNormalizer`, `SignPredictor`, `SignInterpreter`, or `CameraScreen`. Reduces hand detection pixel count by **~85-95%** while preserving parallel latency profile.
 
-### Phase 1: Update State Tracking and Frame Synchronization
+**Steps**
 
-To make cropping work, you must save the wrist coordinates from the *previous* frame's Pose detection to use as the center points for the *current* frame's Hand detection.
+1. **Add cached pose state variables** in LandmarkExtractor.kt
+   - Add instance variables to cache wrist positions and crop size from the previous frame's pose result:
+     - `lastLeftWristNormX/Y: Float` — normalized `[0..1]` left wrist (pose landmark 15), init to `-1f`
+     - `lastRightWristNormX/Y: Float` — normalized `[0..1]` right wrist (pose landmark 16), init to `-1f`
+     - `lastCropSize: Int` — dynamic crop dimension in pixels, init to `200`
+   - These are updated at the end of each `onPoseResult` and consumed at the start of the next `extractAsync`.
 
-1. **Add Pose Tracking Variables:** Inside `LandmarkExtractor.kt`, add variables to store the last known normalized coordinates of the wrists and the dynamic crop size.
-```kotlin
-private var lastLeftWristNormX = -1f
-private var lastLeftWristNormY = -1f
-private var lastRightWristNormX = -1f
-private var lastRightWristNormY = -1f
-private var lastDynamicCropSize = 200 // Default fallback size in pixels
+2. **Update `FrameResult` class** in LandmarkExtractor.kt
+   - Replace `handDone: Boolean` with `leftHandDone: Boolean` and `rightHandDone: Boolean` (both default `false`).
+   - Add per-hand crop metadata for coordinate remapping:
+     - `leftCropStartX/Y: Int`, `leftCropSize: Int`
+     - `rightCropStartX/Y: Int`, `rightCropSize: Int`
+     - `bitmapWidth: Int`, `bitmapHeight: Int`
+   - Keep existing fields: `poseDone`, `features`, `hasData`, `isFrontCamera`.
 
-```
+3. **Replace single `HandLandmarker` with two instances** in LandmarkExtractor.kt
+   - Remove the single `handLandmarker` field.
+   - Create `leftHandLandmarker` and `rightHandLandmarker`, both configured identically: model `hand_landmarker.task`, `Delegate.CPU`, `RunningMode.LIVE_STREAM`, **`numHands = 1`**.
+   - Each gets its own callback: `onLeftHandResult()` and `onRightHandResult()`.
+   - Update `close()` to close both instances.
 
+4. **Rewrite `extractAsync()` to crop using cached pose data** in LandmarkExtractor.kt
+   - Still fires `poseLandmarker.detectAsync(fullImage, ts)` on the full bitmap (unchanged).
+   - **Hand detection now uses cached wrist coords from previous frame:**
+     - If `lastLeftWristNormX == -1f` (cold start / no prior pose): mark both `leftHandDone = true` and `rightHandDone = true` immediately (zero-fill, skip hand detection). This only happens on the very first frame.
+     - Otherwise, for each wrist that has valid cached coords:
+       - Convert normalized coords to pixel coords: `wristPx = (normX * bitmap.width, normY * bitmap.height)`.
+       - Compute crop box: `startX = (wristPxX - cropSize/2).coerceIn(0, bitmap.width - cropSize)`, same for Y. If `cropSize > bitmap.width` or `bitmap.height`, clamp `cropSize` to `min(bitmap.width, bitmap.height)`.
+       - `Bitmap.createBitmap(bitmap, startX, startY, cropSize, cropSize)` → wrap in `BitmapImageBuilder` → `MPImage`.
+       - Store `startX`, `startY`, `cropSize` on `FrameResult` for that hand.
+       - Fire `leftHandLandmarker.detectAsync(leftCropImage, ts)` / `rightHandLandmarker.detectAsync(rightCropImage, ts)`.
+     - If only one wrist has valid cached coords, only crop and detect that hand; mark the other as done (zero-fill).
+   - Store `bitmap.width` and `bitmap.height` on `FrameResult` for coordinate remapping.
+   - **Key**: Pose and both hand detectors now run in **parallel** — no sequential wait. Frame latency stays at `max(pose, hand)`, not `pose + hand`.
 
-2. **Update `FrameResult`:** You need to track the crop bounding boxes so the async callbacks know how to reverse the math later. You also need to track the left and right hands independently.
-```kotlin
-private class FrameResult {
-    var poseDone = false
-    var leftHandDone = false
-    var rightHandDone = false
-    var features: FloatArray? = null
-    var hasData = false
-    var isFrontCamera = true
+5. **Update `onPoseResult()` to cache wrist coords for next frame** in LandmarkExtractor.kt
+   - After writing pose landmarks to `frame.features` (existing logic — unchanged):
+   - Extract raw (pre-mirror) coordinates for:
+     - Pose landmark 15 (left wrist): `x = poseLms[15].x()`, `y = poseLms[15].y()`, `vis = poseLms[15].visibility()`
+     - Pose landmark 16 (right wrist): similarly
+     - Pose landmarks 11/12 (shoulders): for dynamic crop sizing
+   - **Visibility guard**: Only cache a wrist's coords if `visibility > 0.5f`. If below threshold, set that wrist's cached norm to `-1f` (will cause skip on next frame).
+   - **Dynamic crop size**: `shoulderWidthPx = euclidean distance between landmark 11 and 12 in pixel space`. `lastCropSize = (shoulderWidthPx * 1.5f).toInt().coerceIn(120, 300)`.
+   - **Front/rear camera handling**: Cache the **raw** normalized coords (before any mirroring). The crop in `extractAsync()` operates on the original bitmap which hasn't been coordinate-flipped — it's the same bitmap for front and rear. Mirroring is only applied when writing to the feature array.
+   - Call `checkCompletion(ts, frame)` as before.
 
-    // Track the crop boxes used for this specific frame
-    var leftCropStartX = 0
-    var leftCropStartY = 0
-    var leftCropSize = 0
+6. **Implement `onLeftHandResult()` and `onRightHandResult()` with coordinate remapping** in LandmarkExtractor.kt
+   - Each callback follows the same pattern (parameterized by offset: left → 132, right → 195):
+     1. Retrieve `FrameResult` from `pendingFrames[ts]`.
+     2. If `result.landmarks().isNotEmpty()`, set `frame.hasData = true`.
+     3. For each of the 21 hand landmarks (index `j`):
+        - Get crop-local normalized coords: `rawCropX = result.landmarks()[0][j].x()`, `rawCropY = ...y()`, `rawZ = ...z()`.
+        - **Remap to full-frame normalized coords:**
+          ```
+          fullFrameX = (cropStartX + rawCropX * cropSize) / bitmapWidth
+          fullFrameY = (cropStartY + rawCropY * cropSize) / bitmapHeight
+          ```
+        - **Z coordinate**: Keep as-is — MediaPipe Z is depth relative to wrist, not spatial position in the image. No remapping needed.
+        - **Rear camera mirroring**: Apply `if (!frame.isFrontCamera) fullFrameX = 1f - fullFrameX` — same logic as the current `onHandResult`.
+        - **Hand label**: No label-based left/right assignment needed — each callback already knows which hand it is (left landmarker → offset 132, right landmarker → offset 195). For rear camera, swap offsets: left landmarker → 195, right landmarker → 132 (mirrors the existing `isLeft = !isLeft` logic).
+     4. Write `fullFrameX`, `fullFrameY`, `rawZ` to `frame.features!![offset + j*3 .. offset + j*3 + 2]`.
+     5. Mark `frame.leftHandDone = true` (or `rightHandDone`).
+     6. Call `checkCompletion(ts, frame)`.
 
-    var rightCropStartX = 0
-    var rightCropStartY = 0
-    var rightCropSize = 0
-}
+7. **Update `checkCompletion()`** in LandmarkExtractor.kt
+   - Change condition from `poseDone && handDone` to `poseDone && leftHandDone && rightHandDone`.
+   - No bitmap reference to clean up (bitmap is not stored on `FrameResult`).
 
-```
+8. **No changes needed** to:
+   - FrameNormalizer.kt — Anchor subtraction and shoulder-width scaling operate on the feature array values, which are full-frame normalized coordinates after remapping. Identical to current behavior.
+   - SignPredictor.kt — Same 258-float callback, same EMA, same buffer, same prediction trigger.
+   - SignInterpreter.kt — TFLite model input `(1, 30, 780)` and output `(1, 98)` unchanged.
+   - CameraScreen.kt — Camera config (`480×360` analysis resolution), frame delivery, and overlay drawing unchanged.
 
+**Verification**
+- **Crop tracking**: Log `lastCropSize` and wrist pixel coords per frame — expect cropSize ~120-200px at typical signing distance on 480×360 frames
+- **Feature parity**: On a recorded test sequence, compare the 258-float arrays before and after the change — values should be nearly identical (minor differences from crop-edge interpolation)
+- **Latency**: Measure `extractAsync()` → `onResult()` time before and after — expect **40-60% reduction** in hand detection latency while pose latency stays the same, overall frame time improves
+- **Accuracy**: Run a full 30-frame prediction cycle on known signs and verify predictions match pre-change results
+- **Edge cases to test**:
+  - One hand off-screen (one wrist cached, one `-1f`) → only detected hand has landmarks
+  - Hands overlapping / crossed → two separate landmarkers avoid entanglement
+  - Hands near frame edges → crop clamping prevents `createBitmap` crash
+  - Rear camera → X-flip and offset-swap produce correct features
+  - Cold start (frame 1) → zero-filled hands, pose still detected, frame 2 onwards has crops
+  - User moves closer/farther → crop size tracks shoulder width dynamically
 
-
-### Phase 2: Split the HandLandmarker
-
-Since overlapping hands confuse MediaPipe, running two isolated landmarker instances on two separate wrist-cropped images is vastly superior.
-
-1. In `LandmarkExtractor.kt`, replace `handLandmarker` with `leftHandLandmarker` and `rightHandLandmarker`.
-2. Configure both of them exactly the same, but set `.setNumHands(1)` and point them to their respective callbacks (`onLeftHandResult` and `onRightHandResult`).
-
-### Phase 3: The Cropping Pipeline (`extractAsync`)
-
-When a new camera frame arrives, you will use the cached pose data to crop the bitmap before sending it to the hand landmarkers.
-
-1. **Check for Cached Data:** If `lastLeftWristNormX == -1f` (e.g., the very first frame), you cannot crop. Send the full bitmap to both landmarkers.
-2. **Calculate the Crop Boxes:** If you have cached data, convert the normalized wrist coordinates `[0.0 to 1.0]` into actual pixel coordinates by multiplying them by the `bitmap.width` and `bitmap.height`.
-3. **Clamp the Boundaries:** The dynamic crop size (derived from shoulder width) might push the bounding box outside the image edge. You must write a clamping function:
-```kotlin
-val halfSize = lastDynamicCropSize / 2
-var startX = (wristPixelX - halfSize).toInt()
-var startY = (wristPixelY - halfSize).toInt()
-
-// Clamp to boundaries to prevent crash
-startX = maxOf(0, minOf(startX, bitmap.width - lastDynamicCropSize))
-startY = maxOf(0, minOf(startY, bitmap.height - lastDynamicCropSize))
-
-```
-
-
-4. **Save to `FrameResult`:** Store `startX`, `startY`, and `lastDynamicCropSize` into the `FrameResult` object for this timestamp.
-5. **Crop and Execute:** Use `Bitmap.createBitmap(bitmap, startX, startY, size, size)` to create the two tiny images, convert them to `MPImage`, and send them to `leftHandLandmarker` and `rightHandLandmarker` respectively.
-
-### Phase 4: Cache the New Pose Data (`onPoseResult`)
-
-Whenever the Pose landmarker finishes processing a frame, update the tracking variables for the *next* frame.
-
-1. Inside `onPoseResult`, extract the raw coordinates for Landmark 15 (Left Wrist), Landmark 16 (Right Wrist), Landmark 11 (Left Shoulder), and Landmark 12 (Right Shoulder).
-2. **Calculate Dynamic Size:** Calculate the pixel distance between the two shoulders using the Pythagorean theorem (`sqrt(dx^2 + dy^2)`). Multiply this distance by `1.5f` to create a comfortable tracking box size. Save this to `lastDynamicCropSize`.
-3. **Cache the Wrists:** Save the normalized `x` and `y` coordinates of Landmarks 15 and 16 to your `lastLeftWristNormX`, etc.
-* *Note: Only cache them if their `.visibility()` is > 0.5 to prevent tracking ghost limbs.*
-
-
-
-### Phase 5: Coordinate Remapping (`onHandResult`)
-
-When the hand callbacks fire, the coordinates they return will be relative to the tiny 160x160 crop. You must remap them back to the full 640x480 frame.
-
-1. Inside your new `onLeftHandResult` and `onRightHandResult` callbacks, retrieve the `FrameResult` using the timestamp.
-2. Loop through the 21 hand landmarks. Apply this exact math to translate them back to global space:
-```kotlin
-val rawCropX = result.landmarks()[0][j].x() // [0.0 to 1.0] relative to crop
-val rawCropY = result.landmarks()[0][j].y() // [0.0 to 1.0] relative to crop
-
-// 1. Convert to absolute pixels within the full image
-val absolutePixelX = frame.leftCropStartX + (rawCropX * frame.leftCropSize)
-val absolutePixelY = frame.leftCropStartY + (rawCropY * frame.leftCropSize)
-
-// 2. Normalize back to full frame [0.0 to 1.0]
-val fullFrameNormX = absolutePixelX / FULL_IMAGE_WIDTH.toFloat()
-val fullFrameNormY = absolutePixelY / FULL_IMAGE_HEIGHT.toFloat()
-
-```
-
-
-3. Save `fullFrameNormX` and `fullFrameNormY` into the correct index of your `FloatArray(258)`.
-4. Mark `frame.leftHandDone = true` and call `checkCompletion()`.
-
-### Summary of Performance Gains
-
-By implementing this exact flow, your CPU cores will process two ~200x200 images instead of two 640x480 images for hand tracking. This reduces the pixel processing load by roughly 80%. Because the coordinate remapping mathematically restores the landmarks to their global positions, `SignPredictor.kt` and your AI model will function perfectly without knowing the image was ever cropped.
+**Decisions**
+- **Previous-frame caching** (from Gemini): Preserves parallel `max(pose, hand)` latency instead of sequential `pose + hand`. 1-frame lag (~33ms at 30 FPS) causes negligible crop offset (~3-5px of wrist movement).
+- **Dynamic crop**: `shoulderWidthPx × 1.5`, clamped `[120, 300]` — adapts to user distance, prevents degenerate sizes.
+- **Two HandLandmarkers** (`numHands=1` each): Eliminates hand-entanglement on overlapping hands; ~10-15 MB extra memory is acceptable.
+- **Cold-start fallback**: Skip hand detection on first frame (zero-fill) — simplest, and a single zero-filled frame has no impact on the 30-frame prediction buffer.
+- **Visibility threshold** (from Gemini): Only cache wrists with `visibility > 0.5f` — prevents tracking ghost/occluded limbs.
