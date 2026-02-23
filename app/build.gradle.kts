@@ -1,3 +1,4 @@
+import java.util.Properties
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -15,9 +16,30 @@ android {
         versionCode = 1
         versionName = "1.0.0"
 
-        // Gemini API key — set in local.properties: GEMINI_API_KEY=your_key
-        val geminiKey = project.findProperty("GEMINI_API_KEY") as? String ?: ""
-        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
+        defaultConfig {
+            applicationId = "com.isuara.app"
+            minSdk = 26
+            targetSdk = 35
+            versionCode = 1
+            versionName = "1.0.0"
+
+            // 1. Load the local.properties file manually using the imported Properties class
+            val localProperties = Properties()
+            val localPropertiesFile = rootProject.file("local.properties")
+            if (localPropertiesFile.exists()) {
+                localPropertiesFile.inputStream().use { localProperties.load(it) }
+            }
+
+            // 2. Extract the key from the loaded properties object
+            val geminiKey = localProperties.getProperty("GEMINI_API_KEY") ?: ""
+
+            // 3. Define the build config field so the app can see it
+            buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
+
+            ndk {
+                abiFilters += listOf("arm64-v8a", "armeabi-v7a")
+            }
+        }
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")

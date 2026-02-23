@@ -16,7 +16,7 @@ class GeminiTranslator(apiKey: String) {
     }
 
     private val model = GenerativeModel(
-        modelName = "gemini-2.0-flash-lite",
+        modelName = "gemini-2.5-flash-lite",
         apiKey = apiKey
     )
 
