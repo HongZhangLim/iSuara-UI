@@ -37,6 +37,7 @@ class SignPredictor(context: Context) {
     private val frameBuffer = ArrayDeque<FloatArray>(31)
     private val sentenceWords = mutableListOf<String>()
     private var lastWord = ""
+    private var previousFrame: FloatArray? = null // Holds the EMA state
 
     private val _state = MutableStateFlow(PredictionState())
     val state: StateFlow<PredictionState> = _state.asStateFlow()
@@ -48,19 +49,49 @@ class SignPredictor(context: Context) {
         }
     }
 
-    fun processFrame(bitmap: Bitmap, timestampMs: Long) {
+    // We added the isFrontCamera parameter here
+    fun processFrame(bitmap: Bitmap, timestampMs: Long, isFrontCamera: Boolean = true) {
         // Update dimensions immediately for the UI mapping
         _state.update { it.copy(imageWidth = bitmap.width, imageHeight = bitmap.height) }
-        landmarkExtractor.extractAsync(bitmap, timestampMs)
+
+        // Pass the flag down to the extractor
+        landmarkExtractor.extractAsync(bitmap, timestampMs, isFrontCamera)
     }
 
     private fun onLandmarksExtracted(rawKeypoints: FloatArray?, timestampMs: Long) {
         _state.update { it.copy(keypoints = rawKeypoints) }
-        if (rawKeypoints == null) return
 
-        val normalized = FrameNormalizer.normalizeSingleFrame(rawKeypoints)
+        // If no body/hands are detected, clear the previous frame so it doesn't
+        // awkwardly "morph" when hands reappear.
+        if (rawKeypoints == null) {
+            previousFrame = null
+            return
+        }
+
+        val rawNormalized = FrameNormalizer.normalizeSingleFrame(rawKeypoints)
+        val smoothedNormalized = FloatArray(rawNormalized.size)
+        val prev = previousFrame
+
+        // --- APPLY EMA SMOOTHING FILTER ---
+        if (prev == null) {
+            // First frame: Nothing to smooth against, just use the raw values
+            System.arraycopy(rawNormalized, 0, smoothedNormalized, 0, rawNormalized.size)
+        } else {
+            // EMA Math: alpha defines how much we trust the new frame vs the old frame.
+            // 0.4f means 40% new frame, 60% old frame (Heavy smoothing)
+            val alpha = 0.4f
+            for (i in rawNormalized.indices) {
+                smoothedNormalized[i] = (rawNormalized[i] * alpha) + (prev[i] * (1f - alpha))
+            }
+        }
+
+        // Save this smoothed frame to be used as the "previous" frame next time
+        previousFrame = smoothedNormalized.clone()
+        // ----------------------------------
+
         synchronized(frameBuffer) {
-            frameBuffer.addLast(normalized)
+            // Add the smoothed data to the buffer instead of the raw data
+            frameBuffer.addLast(smoothedNormalized)
             if (frameBuffer.size > 30) frameBuffer.removeFirst()
 
             if (frameBuffer.size == 30 && cooldownCounter.get() <= 0 && isPredicting.compareAndSet(false, true)) {
@@ -108,6 +139,7 @@ class SignPredictor(context: Context) {
         synchronized(frameBuffer) { frameBuffer.clear() }
         sentenceWords.clear()
         lastWord = ""
+        previousFrame = null // Reset the smoothing state!
         _state.update { PredictionState() }
     }
     fun close() {

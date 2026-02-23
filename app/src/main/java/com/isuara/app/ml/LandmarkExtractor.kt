@@ -31,6 +31,7 @@ class LandmarkExtractor(
         var handDone = false
         var features: FloatArray? = null
         var hasData = false
+        var isFrontCamera = true // Added this flag
     }
     private val pendingFrames = ConcurrentHashMap<Long, FrameResult>()
 
@@ -53,24 +54,55 @@ class LandmarkExtractor(
         handLandmarker = HandLandmarker.createFromOptions(context, handOptions)
     }
 
-    fun extractAsync(bitmap: Bitmap, timestampMs: Long) { // PINPOINT: Fixes "Unresolved reference"
+    // Added isFrontCamera parameter
+    fun extractAsync(bitmap: Bitmap, timestampMs: Long, isFrontCamera: Boolean) {
         val image = BitmapImageBuilder(bitmap).build()
-        pendingFrames[timestampMs] = FrameResult()
+
+        val frame = FrameResult()
+        frame.isFrontCamera = isFrontCamera // Save the flag for this specific frame
+        pendingFrames[timestampMs] = frame
+
         poseLandmarker?.detectAsync(image, timestampMs)
         handLandmarker?.detectAsync(image, timestampMs)
     }
 
     private fun onPoseResult(result: PoseLandmarkerResult, image: MPImage) {
-        val ts = result.timestampMs() // PINPOINT: Fixes private timestamp error
+        val ts = result.timestampMs()
         val frame = pendingFrames[ts] ?: return
+
+        // THE FIX: A map to swap Left and Right body landmarks (eyes, ears, shoulders, wrists, etc.)
+        val POSE_SWAP_MAP = intArrayOf(
+            0,  // 0: nose
+            4, 5, 6, // 1,2,3 -> 4,5,6 (eyes)
+            1, 2, 3, // 4,5,6 -> 1,2,3 (eyes)
+            8, 7,    // 7,8 -> 8,7 (ears)
+            10, 9,   // 9,10 -> 10,9 (mouth)
+            12, 11,  // 11,12 -> 12,11 (shoulders)
+            14, 13,  // 13,14 -> 14,13 (elbows)
+            16, 15,  // 15,16 -> 16,15 (wrists)
+            18, 17,  // 17,18 -> 18,17 (pinkies)
+            20, 19,  // 19,20 -> 20,19 (indexes)
+            22, 21,  // 21,22 -> 22,21 (thumbs)
+            24, 23,  // 23,24 -> 24,23 (hips)
+            26, 25,  // 25,26 -> 26,25 (knees)
+            28, 27,  // 27,28 -> 28,27 (ankles)
+            30, 29,  // 29,30 -> 30,29 (heels)
+            32, 31   // 31,32 -> 32,31 (foot indexes)
+        )
+
         synchronized(frame) {
             if (frame.features == null) frame.features = FloatArray(258)
             if (result.landmarks().isNotEmpty()) {
                 frame.hasData = true
                 val poseLms = result.landmarks()[0]
                 for (i in 0 until 33) {
-                    val idx = i * 4
-                    frame.features!![idx] = poseLms[i].x()
+
+                    // THE FIX: Use the swapped index for the rear camera!
+                    val mappedIndex = if (frame.isFrontCamera) i else POSE_SWAP_MAP[i]
+                    val idx = mappedIndex * 4
+                    val rawX = poseLms[i].x()
+
+                    frame.features!![idx] = if (frame.isFrontCamera) rawX else (1f - rawX)
                     frame.features!![idx + 1] = poseLms[i].y()
                     frame.features!![idx + 2] = poseLms[i].z()
                     frame.features!![idx + 3] = poseLms[i].visibility().orElse(0f)
@@ -82,18 +114,28 @@ class LandmarkExtractor(
     }
 
     private fun onHandResult(result: HandLandmarkerResult, image: MPImage) {
-        val ts = result.timestampMs() // PINPOINT: Fixes private timestamp error
+        val ts = result.timestampMs()
         val frame = pendingFrames[ts] ?: return
         synchronized(frame) {
             if (frame.features == null) frame.features = FloatArray(258)
             if (result.landmarks().isNotEmpty()) {
                 frame.hasData = true
                 for (i in result.landmarks().indices) {
-                    val isLeft = result.handednesses()[i][0].categoryName() == "Left"
+                    var isLeft = result.handednesses()[i][0].categoryName() == "Left"
+
+                    // THE FIX: Swap hand labels for the rear camera
+                    if (!frame.isFrontCamera) {
+                        isLeft = !isLeft
+                    }
+
                     val offset = if (isLeft) 132 else 195
                     for (j in 0 until 21) {
                         val idx = offset + (j * 3)
-                        frame.features!![idx] = result.landmarks()[i][j].x()
+                        val rawX = result.landmarks()[i][j].x()
+
+                        // THE FIX: Mathematically mirror X for the rear camera
+                        frame.features!![idx] = if (frame.isFrontCamera) rawX else (1f - rawX)
+
                         frame.features!![idx+1] = result.landmarks()[i][j].y()
                         frame.features!![idx+2] = result.landmarks()[i][j].z()
                     }

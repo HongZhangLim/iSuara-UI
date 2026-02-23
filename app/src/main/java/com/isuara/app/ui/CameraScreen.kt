@@ -152,10 +152,16 @@ fun CameraScreen(
                 val offsetY = (size.height - scaledHeight) / 2f
 
                 // 3. Helper function to perfectly map MediaPipe [0..1] values to the screen
+                // 3. Helper function to perfectly map MediaPipe [0..1] values to the screen
                 fun mapX(xNorm: Float): Float {
-                    // PINPOINT: Mirror the x-coordinate for the front camera
-                    // PreviewView mirrors the display, so we must mirror the landmark mapping
-                    return ((1f - xNorm) * scaledWidth) + offsetX
+                    return if (lensFacing == CameraSelector.LENS_FACING_FRONT) {
+                        // Front camera: AI is mirrored, screen is mirrored. Perfect match!
+                        (xNorm * scaledWidth) + offsetX
+                    } else {
+                        // Rear camera: AI is now mathematically mirrored, but the screen is normal.
+                        // Flip the dots back so they line up with the real hand!
+                        ((1f - xNorm) * scaledWidth) + offsetX
+                    }
                 }
 
                 fun mapY(yNorm: Float) = (yNorm * scaledHeight) + offsetY
@@ -407,13 +413,16 @@ private fun processImageProxy(imageProxy: ImageProxy, signPredictor: SignPredict
         val matrix = Matrix().apply {
             // PINPOINT: Rotate the frame so the AI sees a standing person
             postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+
+            // Front camera gets mirrored. Rear camera STAYS NORMAL.
             if (isFrontCamera) {
                 postScale(-1f, 1f, bitmap.width / 2f, bitmap.height / 2f)
             }
         }
         val processedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
 
-        signPredictor.processFrame(processedBitmap, imageProxy.imageInfo.timestamp / 1_000_000)
+        // Pass the isFrontCamera flag to the predictor!
+        signPredictor.processFrame(processedBitmap, imageProxy.imageInfo.timestamp / 1_000_000, isFrontCamera)
 
         if (processedBitmap !== bitmap) processedBitmap.recycle()
         bitmap.recycle()
