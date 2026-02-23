@@ -38,10 +38,13 @@ import com.isuara.app.service.GeminiTranslator
 import com.isuara.app.service.TtsService
 import kotlinx.coroutines.launch
 import java.util.concurrent.Executors
+import androidx.camera.camera2.interop.Camera2Interop
+import androidx.camera.camera2.interop.ExperimentalCamera2Interop
 
 private const val TAG = "CameraScreen"
 
-@OptIn(ExperimentalMaterial3Api::class)
+@androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
+@OptIn(ExperimentalMaterial3Api::class, androidx.camera.camera2.interop.ExperimentalCamera2Interop::class)
 @Composable
 fun CameraScreen(
     signPredictor: SignPredictor,
@@ -86,20 +89,86 @@ fun CameraScreen(
             cameraProviderFuture.addListener({
                 val cameraProvider = cameraProviderFuture.get()
 
-                val preview = Preview.Builder()
-                    .build()
-                    .also { it.surfaceProvider = previewView.surfaceProvider }
+                // 1. Force the Preview to a lighter resolution and 60 FPS
+                val previewBuilder = Preview.Builder()
 
-                val imageAnalysis = ImageAnalysis.Builder()
-                    .setTargetResolution(android.util.Size(640, 480))
+                // Keep the preview resolution reasonable so it doesn't throttle the sensor
+                // (This doesn't make the screen look bad, it just stops it from forcing 4K)
+                previewBuilder.setTargetResolution(android.util.Size(640, 480))
+
+                val previewExt = androidx.camera.camera2.interop.Camera2Interop.Extender(previewBuilder)
+                previewExt.setCaptureRequestOption(
+                    android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                    android.util.Range(30, 60)
+                )
+
+                val preview = previewBuilder.build().also {
+                    it.surfaceProvider = previewView.surfaceProvider
+                }
+
+                val analysisBuilder = ImageAnalysis.Builder()
+                    .setTargetResolution(android.util.Size(480, 360))
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                     .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
-                    .build()
+
+                // Force camera sensor to output 45-60 FPS
+                val ext = androidx.camera.camera2.interop.Camera2Interop.Extender(analysisBuilder)
+                ext.setCaptureRequestOption(
+                    android.hardware.camera2.CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                    android.util.Range(30, 60)
+                )
+
+                val imageAnalysis = analysisBuilder.build()
 
                 val isFront = lensFacing == CameraSelector.LENS_FACING_FRONT
 
+                var reusedBitmap: Bitmap? = null
+                val canvas = android.graphics.Canvas()
+                val matrix = android.graphics.Matrix()
+
                 imageAnalysis.setAnalyzer(mlExecutor) { imageProxy ->
-                    processImageProxy(imageProxy, signPredictor, isFront)
+                    try {
+                        val rawBitmap = imageProxy.toBitmap()
+                        val rotation = imageProxy.imageInfo.rotationDegrees
+
+                        // 1. Calculate the actual dimensions AFTER rotation (portrait swaps width/height)
+                        val isPortrait = rotation == 90 || rotation == 270
+                        val targetWidth = if (isPortrait) rawBitmap.height else rawBitmap.width
+                        val targetHeight = if (isPortrait) rawBitmap.width else rawBitmap.height
+
+                        // 2. Create the reusable bitmap ONCE with the CORRECT rotated dimensions
+                        if (reusedBitmap == null || reusedBitmap!!.width != targetWidth) {
+                            reusedBitmap = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+                        }
+
+                        // 3. Set up rotation and mirroring properly CENTERED
+                        matrix.reset()
+
+                        // Move image center to origin (0,0)
+                        matrix.postTranslate(-rawBitmap.width / 2f, -rawBitmap.height / 2f)
+
+                        // Rotate it
+                        matrix.postRotate(rotation.toFloat())
+
+                        // Mirror if front camera
+                        if (isFront) {
+                            matrix.postScale(-1f, 1f)
+                        }
+
+                        // Move it back to the center of the new canvas
+                        matrix.postTranslate(targetWidth / 2f, targetHeight / 2f)
+
+                        // 4. Draw the raw camera feed onto our reusable bitmap
+                        canvas.setBitmap(reusedBitmap)
+                        canvas.drawColor(android.graphics.Color.BLACK, android.graphics.PorterDuff.Mode.CLEAR) // Clear previous frame
+                        canvas.drawBitmap(rawBitmap, matrix, null)
+
+                        // 5. Pass the correctly oriented bitmap to the AI
+                        signPredictor.processFrame(reusedBitmap!!, imageProxy.imageInfo.timestamp / 1_000_000, isFront)
+
+                    } finally {
+                        imageProxy.close()
+                    }
 
                     // FPS tracking
                     fpsCounter++
@@ -400,33 +469,5 @@ fun CameraScreen(
                 }
             }
         }
-    }
-}
-
-/**
- * Convert ImageProxy to Bitmap and feed to SignPredictor.
- * Runs on the ML executor thread.
- */
-private fun processImageProxy(imageProxy: ImageProxy, signPredictor: SignPredictor, isFrontCamera: Boolean) {
-    try {
-        val bitmap = imageProxy.toBitmap()
-        val matrix = Matrix().apply {
-            // PINPOINT: Rotate the frame so the AI sees a standing person
-            postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-
-            // Front camera gets mirrored. Rear camera STAYS NORMAL.
-            if (isFrontCamera) {
-                postScale(-1f, 1f, bitmap.width / 2f, bitmap.height / 2f)
-            }
-        }
-        val processedBitmap = Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-
-        // Pass the isFrontCamera flag to the predictor!
-        signPredictor.processFrame(processedBitmap, imageProxy.imageInfo.timestamp / 1_000_000, isFrontCamera)
-
-        if (processedBitmap !== bitmap) processedBitmap.recycle()
-        bitmap.recycle()
-    } finally {
-        imageProxy.close()
     }
 }
