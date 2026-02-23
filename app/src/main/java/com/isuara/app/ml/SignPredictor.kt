@@ -89,26 +89,36 @@ class SignPredictor(context: Context) {
         previousFrame = smoothedNormalized.clone()
         // ----------------------------------
 
+        var readyToPredict = false
+        var snapshot: Array<FloatArray>? = null
+
         synchronized(frameBuffer) {
             // Add the smoothed data to the buffer instead of the raw data
             frameBuffer.addLast(smoothedNormalized)
             if (frameBuffer.size > 30) frameBuffer.removeFirst()
 
-            if (frameBuffer.size == 30 && cooldownCounter.get() <= 0 && isPredicting.compareAndSet(false, true)) {
-                val sequence = frameBuffer.toTypedArray()
-                inferenceScope.launch {
-                    try {
-                        val features = FrameNormalizer.buildSequenceFeatures(sequence)
-                        val (idx, conf) = signInterpreter.predictTopClass(features)
-                        updatePrediction(labels[idx], conf)
-                    } finally {
-                        isPredicting.set(false)
-                    }
-                }
+            // Check if ready, but don't launch coroutine inside the lock
+            if (frameBuffer.size == 30 && cooldownCounter.get() <= 0 && !isPredicting.get()) {
+                isPredicting.set(true) // Set immediately so we don't trigger twice
+                readyToPredict = true
+                snapshot = frameBuffer.toTypedArray()
             } else if (cooldownCounter.get() > 0) {
                 cooldownCounter.decrementAndGet()
             }
             updateProgress()
+        }
+
+        // Launch inference OUTSIDE the lock so MediaPipe isn't blocked waiting for AI
+        if (readyToPredict && snapshot != null) {
+            inferenceScope.launch {
+                try {
+                    val features = FrameNormalizer.buildSequenceFeatures(snapshot!!)
+                    val (idx, conf) = signInterpreter.predictTopClass(features)
+                    updatePrediction(labels[idx], conf)
+                } finally {
+                    isPredicting.set(false)
+                }
+            }
         }
     }
 
