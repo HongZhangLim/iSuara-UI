@@ -1,3 +1,41 @@
+## Root Cause Analysis: V3.1.3 Regression
+
+I found **5 bugs/issues**, ranked by severity:
+
+### Bug 1 (CRITICAL): Idle prefix corrupts velocity/acceleration features
+The pipeline runs: Speed variants → **Stages 1-5 (computes velocity/accel)** → **Idle prefix insertion**. When idle frames are prepended and tail frames truncated, the pre-computed velocity at the idle→sign boundary is **stale** — it reflects the original `frame[0]→frame[1]` transition, not the actual `idle_frame[-1]→sign_frame[0]` transition. **30% of training samples have corrupted derivative features.** This is the #1 cause of accuracy loss.
+
+### Bug 2 (HIGH): NumpySequence doesn't shuffle between epochs
+The `NumpySequence` class has no `on_epoch_end()` method. When `model.fit()` receives a `Sequence`, `shuffle=True` is ignored — Keras only shuffles raw arrays, not `Sequence` objects. The model sees batches in the **same order every epoch**, degrading convergence and causing the jittery validation loss.
+
+### Bug 3 (HIGH): Z-score statistics skewed by speed variants
+Z-score mean/std is computed on the full augmented training set which is 75% speed-variant data (with lots of hold-padded zeros in velocity/accel channels). Val/test only see 1× speed data. The z-score transform applies a **mismatched distribution** to val/test, directly explaining the train-val gap.
+
+### Bug 4 (MEDIUM): 3× speed tier too aggressive  
+10 real frames + 20 hold-padded frames = 67% static padding. Many of the 98 signs become indistinguishable at 10-frame resolution, diluting the training signal.
+
+### Bug 5 (MEDIUM): Initial LR=0.001 too high
+The training log shows the model only improved significantly after `ReduceLROnPlateau` dropped LR to 0.0005 at epoch 66, wasting 66 epochs.
+
+---
+
+## Plan: V3.1.4 Fixes
+
+Here are the concrete changes I'll make to the `V3.1.3 copy.ipynb`:
+
+| Fix | Cell | Change |
+|---|---|---|
+| **Rename to V3.1.4** | Cell 1 (markdown) | Update title, version table, changelog |
+| **Remove idle prefix entirely** | Cell 10 (functions) | Delete `augment_idle_prefix()` — the velocity corruption bug makes it harmful. Can be re-added in V3.1.5 if moved before Stages 3-5 with derivative recomputation. |
+| **Drop 3× speed tier** | Cell 10 (functions) | Change default `speed_tiers` to only `[1.5×, 2×]` (3 tiers total including 1×) |
+| **Add epoch shuffle to NumpySequence** | Cell 16 (training) | Add `on_epoch_end()` with `np.random.permutation` index shuffle |
+| **Z-score on 1× data only** | Cell 12 (pipeline) | Compute SCALER_MEAN/SCALER_SCALE from original-speed training samples only, before concatenating speed variants into the augmented array |
+| **Lower initial LR to 0.0003** | Cell 14 (model) + Cell 16 (training) | `Adam(learning_rate=0.0003)` — more conservative start |
+| **Increase ReduceLROnPlateau patience** | Cell 16 (training) | `patience=15` (was 10) — gives the lower LR more time before further reduction |
+| **Update pipeline summary, eval, exports** | Cells 12, 18, 20, 22, 24, 27 | Version numbers, speed tier references, remove idle prefix references |
+
+
+
 ## Plan: V3.1.3 — Multi-Speed Temporal Downsampling for Variable-Duration Sign Recognition
 
 ### TL;DR
