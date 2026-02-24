@@ -11,8 +11,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.json.JSONObject
-
-// Make sure to add this import at the top of your file:
 import java.util.concurrent.atomic.AtomicBoolean
 
 class SignPredictor(context: Context) {
@@ -36,25 +34,26 @@ class SignPredictor(context: Context) {
     private val isPredicting = AtomicBoolean(false)
 
     // --- Stride logic ---
-    private val predictionStride = 2 // Predict every 2 frames (~25Hz at 50fps)
+    private val predictionStride = 2
     private var frameCounter = 0
 
     private val frameBuffer = ArrayDeque<FloatArray>(31)
+
+    // Smooths the input coordinates
     private var previousFrame: FloatArray? = null
 
-    // --- NEW: Re-add sentence list and initialize Segmenter ---
+    // Smooths the output probabilities (NEW)
+    private var previousPredictions: FloatArray? = null
+
     private val sentenceWords = mutableListOf<String>()
 
     private val segmenter = SignSegmenter(
         onEmit = { emittedWord ->
-            // When the segmenter confirms a word, add it to our sentence!
             sentenceWords.add(emittedWord)
             if (sentenceWords.size > 8) sentenceWords.removeAt(0)
-
             _state.update { it.copy(sentence = sentenceWords.toList()) }
         },
         onTrackingUpdate = { word, confidence, isConfident ->
-            // Update the UI smoothly
             _state.update { it.copy(
                 currentWord = if (isConfident || word.isEmpty()) word else "$word?",
                 confidence = confidence,
@@ -81,16 +80,31 @@ class SignPredictor(context: Context) {
     private fun onLandmarksExtracted(rawKeypoints: FloatArray?, timestampMs: Long) {
         _state.update { it.copy(keypoints = rawKeypoints) }
 
+        // --- THE VANISHING HANDS FIX ---
         if (rawKeypoints == null) {
+            // 1. Reset EMA smoothers so old data doesn't bleed into new signs
             previousFrame = null
+            previousPredictions = null
+
+            // 2. Clear the physical frame buffer so we don't hold "stale" poses
+            synchronized(frameBuffer) {
+                frameBuffer.clear()
+            }
+            updateProgress() // Keep UI buffer progress accurate (it will drop to 0)
+
+            // 3. Manually feed an "idle" prediction to the segmenter to increment idleCount
+            // and unlock the lastEmittedClass lock!
+            segmenter.processPrediction("idle", 1.0f)
+
             return
         }
+        // --------------------------------
 
         val rawNormalized = FrameNormalizer.normalizeSingleFrame(rawKeypoints)
         val smoothedNormalized = FloatArray(rawNormalized.size)
         val prev = previousFrame
 
-        // --- APPLY EMA SMOOTHING FILTER ---
+        // 1. INPUT EMA SMOOTHING
         if (prev == null) {
             System.arraycopy(rawNormalized, 0, smoothedNormalized, 0, rawNormalized.size)
         } else {
@@ -108,7 +122,6 @@ class SignPredictor(context: Context) {
             frameBuffer.addLast(smoothedNormalized)
             if (frameBuffer.size > 30) frameBuffer.removeFirst()
 
-            // --- Continuous Sliding Window Logic ---
             frameCounter = (frameCounter + 1) % predictionStride
 
             if (frameBuffer.size == 30 && frameCounter == 0) {
@@ -118,19 +131,42 @@ class SignPredictor(context: Context) {
             updateProgress()
         }
 
-        // Launch inference using a Drop-If-Busy lock
         if (readyToPredict && snapshot != null) {
-            // Only enter if false, and immediately set to true
             if (isPredicting.compareAndSet(false, true)) {
                 inferenceScope.launch {
                     try {
                         val features = FrameNormalizer.buildSequenceFeatures(snapshot!!)
-                        val (idx, conf) = signInterpreter.predictTopClass(features)
-                        val predictedClass = labels[idx]
 
-                        segmenter.processPrediction(predictedClass, conf)
+                        val rawPredictions = signInterpreter.predict(features)
+
+                        // 2. OUTPUT EMA SMOOTHING
+                        val smoothedPredictions = FloatArray(rawPredictions.size)
+                        val prevPreds = previousPredictions
+
+                        if (prevPreds == null) {
+                            System.arraycopy(rawPredictions, 0, smoothedPredictions, 0, rawPredictions.size)
+                        } else {
+                            val alpha = 0.4f
+                            for (i in rawPredictions.indices) {
+                                smoothedPredictions[i] = (rawPredictions[i] * alpha) + (prevPreds[i] * (1f - alpha))
+                            }
+                        }
+                        previousPredictions = smoothedPredictions.clone()
+
+                        // 3. Find the NEW top class from the smoothed array
+                        var topIdx = -1
+                        var maxConf = -1f
+                        for (i in smoothedPredictions.indices) {
+                            if (smoothedPredictions[i] > maxConf) {
+                                maxConf = smoothedPredictions[i]
+                                topIdx = i
+                            }
+                        }
+
+                        val predictedClass = labels[topIdx]
+                        segmenter.processPrediction(predictedClass, maxConf)
+
                     } finally {
-                        // ALWAYS release the lock, even if the model throws an error
                         isPredicting.set(false)
                     }
                 }
@@ -146,12 +182,12 @@ class SignPredictor(context: Context) {
     fun resetAll() {
         synchronized(frameBuffer) { frameBuffer.clear() }
         previousFrame = null
+        previousPredictions = null // Reset prediction EMA
         sentenceWords.clear()
         segmenter.reset()
         _state.update { PredictionState() }
     }
 
-    // Also re-add this getter if your UI needs it:
     fun getSentenceWords() = sentenceWords.toList()
 
     fun close() {
