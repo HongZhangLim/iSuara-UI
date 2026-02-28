@@ -1,12 +1,16 @@
 # iSuara: Edge ML Sign Language Interpreter
 
+### 🚀 Try it Live
+[![Download APK](https://img.shields.io/badge/Download_APK_V3.1.5-iSuara-2ea44f?style=for-the-badge&logo=android)]([YOUR_COPIED_GITHUB_RELEASE_LINK_HERE](https://github.com/HongZhangLim/iSuara-UI/releases/download/Stable/iSuara_V3.1.5.apk))
 
+*(Note: Ensure you allow "Install from unknown sources" on your Android device to install the prototype).*
 
 ## 1. Repository Overview & Team Introduction
 
 Welcome to the official repository for **iSuara**, an Edge-AI Android application built to provide real-time, pocket-sized translation of Bahasa Isyarat Malaysia (BIM) into spoken Malay. This repository contains the complete Android Studio project, including the native Kotlin UI, MediaPipe vision extractors, TensorFlow Lite inference pipeline, and Gemini API integration.
 
 **Team Name:** sudo rm -rf /
+
 **Team Members:** LIM HONG ZHANG, TAN CHEE KEAT, YONG JUN ONN, JITESH A/L MOGANA RAJA
 
 ---
