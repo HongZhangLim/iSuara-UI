@@ -16,7 +16,7 @@ import java.util.concurrent.ConcurrentHashMap
 
 class LandmarkExtractor(
     context: Context,
-    private val onResult: (FloatArray?, Long) -> Unit // PINPOINT: Fixes "Too many arguments"
+    private val onResult: (FloatArray?, Long) -> Unit
 ) {
 
     companion object {
@@ -26,16 +26,33 @@ class LandmarkExtractor(
     private var poseLandmarker: PoseLandmarker? = null
     private var handLandmarker: HandLandmarker? = null
 
+    // Cached Pose State Variables
+    private var lastLeftWristNormX = -1f
+    private var lastLeftWristNormY = -1f
+    private var lastRightWristNormX = -1f
+    private var lastRightWristNormY = -1f
+    private var lastShoulderWidthPx = 150f
+
     private class FrameResult {
         var poseDone = false
         var handDone = false
         var features: FloatArray? = null
         var hasData = false
-        var isFrontCamera = true // Added this flag
+        var isFrontCamera = true
+
+        // Unified Crop metadata for coordinate remapping
+        var bitmapWidth = 0
+        var bitmapHeight = 0
+        var cropStartX = 0
+        var cropStartY = 0
+        var cropWidth = 0
+        var cropHeight = 0
     }
+
     private val pendingFrames = ConcurrentHashMap<Long, FrameResult>()
 
     init {
+        // Single CPU HandLandmarker searching for 2 hands
         val handOptions = HandLandmarker.HandLandmarkerOptions.builder()
             .setBaseOptions(BaseOptions.builder().setModelAssetPath("hand_landmarker.task").setDelegate(Delegate.CPU).build())
             .setRunningMode(RunningMode.LIVE_STREAM)
@@ -45,7 +62,7 @@ class LandmarkExtractor(
         handLandmarker = HandLandmarker.createFromOptions(context, handOptions)
 
         try {
-            // Try GPU First for Pose (Fastest)
+            // GPU Pose Fallback setup
             val poseOptionsGPU = PoseLandmarker.PoseLandmarkerOptions.builder()
                 .setBaseOptions(BaseOptions.builder().setModelAssetPath("pose_landmarker_lite.task").setDelegate(Delegate.GPU).build())
                 .setRunningMode(RunningMode.LIVE_STREAM)
@@ -54,7 +71,6 @@ class LandmarkExtractor(
             poseLandmarker = PoseLandmarker.createFromOptions(context, poseOptionsGPU)
             Log.d(TAG, "PoseLandmarker loaded on GPU")
         } catch (e: Exception) {
-            // Fallback to CPU if device GPU is incompatible
             Log.w(TAG, "GPU Delegate failed, falling back to CPU", e)
             val poseOptionsCPU = PoseLandmarker.PoseLandmarkerOptions.builder()
                 .setBaseOptions(BaseOptions.builder().setModelAssetPath("pose_landmarker_lite.task").setDelegate(Delegate.CPU).build())
@@ -65,23 +81,81 @@ class LandmarkExtractor(
         }
     }
 
-    // Added isFrontCamera parameter
     fun extractAsync(bitmap: Bitmap, timestampMs: Long, isFrontCamera: Boolean) {
-        val image = BitmapImageBuilder(bitmap).build()
-
         val frame = FrameResult()
-        frame.isFrontCamera = isFrontCamera // Save the flag for this specific frame
+        frame.isFrontCamera = isFrontCamera
+        frame.bitmapWidth = bitmap.width
+        frame.bitmapHeight = bitmap.height
         pendingFrames[timestampMs] = frame
 
-        poseLandmarker?.detectAsync(image, timestampMs)
-        handLandmarker?.detectAsync(image, timestampMs)
+        // 1. Pose always runs on full resolution
+        poseLandmarker?.detectAsync(BitmapImageBuilder(bitmap).build(), timestampMs)
+
+        // 2. Calculate Unified Bounding Box for Hands
+        var minX = Float.MAX_VALUE
+        var maxX = Float.MIN_VALUE
+        var minY = Float.MAX_VALUE
+        var maxY = Float.MIN_VALUE
+        var activeWrists = 0
+
+        if (lastLeftWristNormX >= 0f) {
+            minX = minOf(minX, lastLeftWristNormX)
+            maxX = maxOf(maxX, lastLeftWristNormX)
+            minY = minOf(minY, lastLeftWristNormY)
+            maxY = maxOf(maxY, lastLeftWristNormY)
+            activeWrists++
+        }
+        if (lastRightWristNormX >= 0f) {
+            minX = minOf(minX, lastRightWristNormX)
+            maxX = maxOf(maxX, lastRightWristNormX)
+            minY = minOf(minY, lastRightWristNormY)
+            maxY = maxOf(maxY, lastRightWristNormY)
+            activeWrists++
+        }
+
+        if (activeWrists > 0) {
+            // Padding based on user's shoulder width
+            val paddingXNorm = (lastShoulderWidthPx * 1.5f) / bitmap.width
+            val paddingYNorm = (lastShoulderWidthPx * 1.5f) / bitmap.height
+
+            // Shift crop slightly UPWARDS (lower Y value) because fingers are above the wrist
+            val yOffsetNorm = paddingYNorm * 0.4f
+
+            val startXNorm = (minX - paddingXNorm).coerceIn(0f, 1f)
+            val endXNorm = (maxX + paddingXNorm).coerceIn(0f, 1f)
+            val startYNorm = (minY - paddingYNorm - yOffsetNorm).coerceIn(0f, 1f)
+            val endYNorm = (maxY + paddingYNorm - yOffsetNorm).coerceIn(0f, 1f)
+
+            frame.cropStartX = (startXNorm * bitmap.width).toInt()
+            frame.cropStartY = (startYNorm * bitmap.height).toInt()
+            frame.cropWidth = ((endXNorm - startXNorm) * bitmap.width).toInt()
+            frame.cropHeight = ((endYNorm - startYNorm) * bitmap.height).toInt()
+
+            // Safety check for valid crop dimensions
+            if (frame.cropWidth > 10 && frame.cropHeight > 10) {
+                val crop = Bitmap.createBitmap(bitmap, frame.cropStartX, frame.cropStartY, frame.cropWidth, frame.cropHeight)
+                handLandmarker?.detectAsync(BitmapImageBuilder(crop).build(), timestampMs)
+            } else {
+                runFullFrameHand(bitmap, timestampMs, frame)
+            }
+        } else {
+            // Cold start / wrists hidden -> run full frame
+            runFullFrameHand(bitmap, timestampMs, frame)
+        }
+    }
+
+    private fun runFullFrameHand(bitmap: Bitmap, timestampMs: Long, frame: FrameResult) {
+        frame.cropStartX = 0
+        frame.cropStartY = 0
+        frame.cropWidth = bitmap.width
+        frame.cropHeight = bitmap.height
+        handLandmarker?.detectAsync(BitmapImageBuilder(bitmap).build(), timestampMs)
     }
 
     private fun onPoseResult(result: PoseLandmarkerResult, image: MPImage) {
         val ts = result.timestampMs()
         val frame = pendingFrames[ts] ?: return
 
-        // THE FIX: A map to swap Left and Right body landmarks (eyes, ears, shoulders, wrists, etc.)
         val POSE_SWAP_MAP = intArrayOf(
             0,  // 0: nose
             4, 5, 6, // 1,2,3 -> 4,5,6 (eyes)
@@ -106,9 +180,9 @@ class LandmarkExtractor(
             if (result.landmarks().isNotEmpty()) {
                 frame.hasData = true
                 val poseLms = result.landmarks()[0]
-                for (i in 0 until 33) {
 
-                    // THE FIX: Use the swapped index for the rear camera!
+                // Write swapped/mirrored array mapping
+                for (i in 0 until 33) {
                     val mappedIndex = if (frame.isFrontCamera) i else POSE_SWAP_MAP[i]
                     val idx = mappedIndex * 4
                     val rawX = poseLms[i].x()
@@ -118,6 +192,20 @@ class LandmarkExtractor(
                     frame.features!![idx + 2] = poseLms[i].z()
                     frame.features!![idx + 3] = poseLms[i].visibility().orElse(0f)
                 }
+
+                // Cache RAW coords for next frame's unified crop
+                lastLeftWristNormX = if (poseLms[15].visibility().orElse(0f) > 0.5f) poseLms[15].x() else -1f
+                lastLeftWristNormY = if (poseLms[15].visibility().orElse(0f) > 0.5f) poseLms[15].y() else -1f
+                lastRightWristNormX = if (poseLms[16].visibility().orElse(0f) > 0.5f) poseLms[16].x() else -1f
+                lastRightWristNormY = if (poseLms[16].visibility().orElse(0f) > 0.5f) poseLms[16].y() else -1f
+
+                // Dynamic padding based on shoulder width
+                val dx = (poseLms[11].x() - poseLms[12].x()) * frame.bitmapWidth
+                val dy = (poseLms[11].y() - poseLms[12].y()) * frame.bitmapHeight
+                lastShoulderWidthPx = Math.sqrt((dx * dx + dy * dy).toDouble()).toFloat().coerceAtLeast(100f)
+            } else {
+                lastLeftWristNormX = -1f
+                lastRightWristNormX = -1f
             }
             frame.poseDone = true
             checkCompletion(ts, frame)
@@ -127,28 +215,34 @@ class LandmarkExtractor(
     private fun onHandResult(result: HandLandmarkerResult, image: MPImage) {
         val ts = result.timestampMs()
         val frame = pendingFrames[ts] ?: return
+
         synchronized(frame) {
             if (frame.features == null) frame.features = FloatArray(258)
             if (result.landmarks().isNotEmpty()) {
                 frame.hasData = true
-                for (i in result.landmarks().indices) {
-                    var isLeft = result.handednesses()[i][0].categoryName() == "Left"
+                for ((i, handLms) in result.landmarks().withIndex()) {
+                    val handedness = result.handednesses()[i][0].categoryName()
 
-                    // THE FIX: Swap hand labels for the rear camera
+                    // Assign Left/Right accurately based on camera facing
+                    var isLeft = handedness.equals("Left", ignoreCase = true)
                     if (!frame.isFrontCamera) {
                         isLeft = !isLeft
                     }
-
                     val offset = if (isLeft) 132 else 195
+
                     for (j in 0 until 21) {
                         val idx = offset + (j * 3)
-                        val rawX = result.landmarks()[i][j].x()
 
-                        // THE FIX: Mathematically mirror X for the rear camera
-                        frame.features!![idx] = if (frame.isFrontCamera) rawX else (1f - rawX)
+                        // Remap from Crop space back to Full Frame space
+                        val cropX = handLms[j].x()
+                        val cropY = handLms[j].y()
+                        val fullFrameX = (frame.cropStartX + cropX * frame.cropWidth) / frame.bitmapWidth
+                        val fullFrameY = (frame.cropStartY + cropY * frame.cropHeight) / frame.bitmapHeight
 
-                        frame.features!![idx+1] = result.landmarks()[i][j].y()
-                        frame.features!![idx+2] = result.landmarks()[i][j].z()
+                        // Mathematically mirror X for the rear camera
+                        frame.features!![idx] = if (frame.isFrontCamera) fullFrameX else (1f - fullFrameX)
+                        frame.features!![idx + 1] = fullFrameY
+                        frame.features!![idx + 2] = handLms[j].z()
                     }
                 }
             }
