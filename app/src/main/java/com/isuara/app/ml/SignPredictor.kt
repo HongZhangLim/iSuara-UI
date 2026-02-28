@@ -2,7 +2,6 @@ package com.isuara.app.ml
 
 import android.content.Context
 import android.graphics.Bitmap
-import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -13,7 +12,6 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
 class SignPredictor(context: Context) {
 
@@ -24,20 +22,45 @@ class SignPredictor(context: Context) {
         val bufferProgress: Float = 0f,
         val sentence: List<String> = emptyList(),
         val keypoints: FloatArray? = null,
-        val imageWidth: Int = 480,  // PINPOINT: Fixes "No parameter found"
-        val imageHeight: Int = 640  // PINPOINT: Fixes "No parameter found"
+        val imageWidth: Int = 480,
+        val imageHeight: Int = 640
     )
 
     private val landmarkExtractor = LandmarkExtractor(context, this::onLandmarksExtracted)
     private val signInterpreter = SignInterpreter(context)
     private val labels: List<String>
     private val inferenceScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
     private val isPredicting = AtomicBoolean(false)
-    private val cooldownCounter = AtomicInteger(0)
+
+    // --- Stride logic ---
+    private val predictionStride = 2
+    private var frameCounter = 0
+
     private val frameBuffer = ArrayDeque<FloatArray>(31)
+
+    // Smooths the input coordinates
+    private var previousFrame: FloatArray? = null
+
+    // Smooths the output probabilities (NEW)
+    private var previousPredictions: FloatArray? = null
+
     private val sentenceWords = mutableListOf<String>()
-    private var lastWord = ""
-    private var previousFrame: FloatArray? = null // Holds the EMA state
+
+    private val segmenter = SignSegmenter(
+        onEmit = { emittedWord ->
+            sentenceWords.add(emittedWord)
+            if (sentenceWords.size > 8) sentenceWords.removeAt(0)
+            _state.update { it.copy(sentence = sentenceWords.toList()) }
+        },
+        onTrackingUpdate = { word, confidence, isConfident ->
+            _state.update { it.copy(
+                currentWord = if (isConfident || word.isEmpty()) word else "$word?",
+                confidence = confidence,
+                isConfident = isConfident
+            ) }
+        }
+    )
 
     private val _state = MutableStateFlow(PredictionState())
     val state: StateFlow<PredictionState> = _state.asStateFlow()
@@ -49,94 +72,106 @@ class SignPredictor(context: Context) {
         }
     }
 
-    // We added the isFrontCamera parameter here
     fun processFrame(bitmap: Bitmap, timestampMs: Long, isFrontCamera: Boolean = true) {
-        // Update dimensions immediately for the UI mapping
         _state.update { it.copy(imageWidth = bitmap.width, imageHeight = bitmap.height) }
-
-        // Pass the flag down to the extractor
         landmarkExtractor.extractAsync(bitmap, timestampMs, isFrontCamera)
     }
 
     private fun onLandmarksExtracted(rawKeypoints: FloatArray?, timestampMs: Long) {
         _state.update { it.copy(keypoints = rawKeypoints) }
 
-        // If no body/hands are detected, clear the previous frame so it doesn't
-        // awkwardly "morph" when hands reappear.
+        // --- THE VANISHING HANDS FIX ---
         if (rawKeypoints == null) {
+            // 1. Reset EMA smoothers so old data doesn't bleed into new signs
             previousFrame = null
+            previousPredictions = null
+
+            // 2. Clear the physical frame buffer so we don't hold "stale" poses
+            synchronized(frameBuffer) {
+                frameBuffer.clear()
+            }
+            updateProgress() // Keep UI buffer progress accurate (it will drop to 0)
+
+            // 3. Manually feed an "idle" prediction to the segmenter to increment idleCount
+            // and unlock the lastEmittedClass lock!
+            segmenter.processPrediction("idle", 1.0f)
+
             return
         }
+        // --------------------------------
 
         val rawNormalized = FrameNormalizer.normalizeSingleFrame(rawKeypoints)
         val smoothedNormalized = FloatArray(rawNormalized.size)
         val prev = previousFrame
 
-        // --- APPLY EMA SMOOTHING FILTER ---
+        // 1. INPUT EMA SMOOTHING
         if (prev == null) {
-            // First frame: Nothing to smooth against, just use the raw values
             System.arraycopy(rawNormalized, 0, smoothedNormalized, 0, rawNormalized.size)
         } else {
-            // EMA Math: alpha defines how much we trust the new frame vs the old frame.
-            // 0.4f means 40% new frame, 60% old frame (Heavy smoothing)
             val alpha = 0.4f
             for (i in rawNormalized.indices) {
                 smoothedNormalized[i] = (rawNormalized[i] * alpha) + (prev[i] * (1f - alpha))
             }
         }
-
-        // Save this smoothed frame to be used as the "previous" frame next time
         previousFrame = smoothedNormalized.clone()
-        // ----------------------------------
 
         var readyToPredict = false
         var snapshot: Array<FloatArray>? = null
 
         synchronized(frameBuffer) {
-            // Add the smoothed data to the buffer instead of the raw data
             frameBuffer.addLast(smoothedNormalized)
             if (frameBuffer.size > 30) frameBuffer.removeFirst()
 
-            // Check if ready, but don't launch coroutine inside the lock
-            if (frameBuffer.size == 30 && cooldownCounter.get() <= 0 && !isPredicting.get()) {
-                isPredicting.set(true) // Set immediately so we don't trigger twice
+            frameCounter = (frameCounter + 1) % predictionStride
+
+            if (frameBuffer.size == 30 && frameCounter == 0) {
                 readyToPredict = true
                 snapshot = frameBuffer.toTypedArray()
-            } else if (cooldownCounter.get() > 0) {
-                cooldownCounter.decrementAndGet()
             }
             updateProgress()
         }
 
-        // Launch inference OUTSIDE the lock so MediaPipe isn't blocked waiting for AI
         if (readyToPredict && snapshot != null) {
-            inferenceScope.launch {
-                try {
-                    val features = FrameNormalizer.buildSequenceFeatures(snapshot!!)
-                    val (idx, conf) = signInterpreter.predictTopClass(features)
-                    updatePrediction(labels[idx], conf)
-                } finally {
-                    isPredicting.set(false)
+            if (isPredicting.compareAndSet(false, true)) {
+                inferenceScope.launch {
+                    try {
+                        val features = FrameNormalizer.buildSequenceFeatures(snapshot!!)
+
+                        val rawPredictions = signInterpreter.predict(features)
+
+                        // 2. OUTPUT EMA SMOOTHING
+                        val smoothedPredictions = FloatArray(rawPredictions.size)
+                        val prevPreds = previousPredictions
+
+                        if (prevPreds == null) {
+                            System.arraycopy(rawPredictions, 0, smoothedPredictions, 0, rawPredictions.size)
+                        } else {
+                            val alpha = 0.4f
+                            for (i in rawPredictions.indices) {
+                                smoothedPredictions[i] = (rawPredictions[i] * alpha) + (prevPreds[i] * (1f - alpha))
+                            }
+                        }
+                        previousPredictions = smoothedPredictions.clone()
+
+                        // 3. Find the NEW top class from the smoothed array
+                        var topIdx = -1
+                        var maxConf = -1f
+                        for (i in smoothedPredictions.indices) {
+                            if (smoothedPredictions[i] > maxConf) {
+                                maxConf = smoothedPredictions[i]
+                                topIdx = i
+                            }
+                        }
+
+                        val predictedClass = labels[topIdx]
+                        segmenter.processPrediction(predictedClass, maxConf)
+
+                    } finally {
+                        isPredicting.set(false)
+                    }
                 }
             }
         }
-    }
-
-    private fun updatePrediction(word: String, confidence: Float) {
-        val isConfident = confidence >= 0.6f
-        if (isConfident && word != lastWord && word != "Idle") {
-            sentenceWords.add(word)
-            lastWord = word
-            if (sentenceWords.size > 8) sentenceWords.removeAt(0)
-        }
-        _state.update { it.copy(
-            currentWord = if (isConfident) word else "$word?",
-            confidence = confidence,
-            isConfident = isConfident,
-            sentence = sentenceWords.toList(),
-            bufferProgress = 1f
-        ) }
-        cooldownCounter.set(if (isConfident) 10 else 5)
     }
 
     private fun updateProgress() {
@@ -144,14 +179,17 @@ class SignPredictor(context: Context) {
         _state.update { it.copy(bufferProgress = progress) }
     }
 
-    fun getSentenceWords() = sentenceWords.toList()
     fun resetAll() {
         synchronized(frameBuffer) { frameBuffer.clear() }
+        previousFrame = null
+        previousPredictions = null // Reset prediction EMA
         sentenceWords.clear()
-        lastWord = ""
-        previousFrame = null // Reset the smoothing state!
+        segmenter.reset()
         _state.update { PredictionState() }
     }
+
+    fun getSentenceWords() = sentenceWords.toList()
+
     fun close() {
         landmarkExtractor.close()
         signInterpreter.close()

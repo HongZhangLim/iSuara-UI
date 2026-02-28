@@ -16,30 +16,18 @@ android {
         versionCode = 1
         versionName = "1.0.0"
 
-        defaultConfig {
-            applicationId = "com.isuara.app"
-            minSdk = 26
-            targetSdk = 35
-            versionCode = 1
-            versionName = "1.0.0"
-
-            // 1. Load the local.properties file manually using the imported Properties class
-            val localProperties = Properties()
-            val localPropertiesFile = rootProject.file("local.properties")
-            if (localPropertiesFile.exists()) {
-                localPropertiesFile.inputStream().use { localProperties.load(it) }
-            }
-
-            // 2. Extract the key from the loaded properties object
-            val geminiKey = localProperties.getProperty("GEMINI_API_KEY") ?: ""
-
-            // 3. Define the build config field so the app can see it
-            buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
-
-            ndk {
-                abiFilters += listOf("arm64-v8a", "armeabi-v7a")
-            }
+        // 1. Load the local.properties file manually using the imported Properties class
+        val localProperties = Properties()
+        val localPropertiesFile = rootProject.file("local.properties")
+        if (localPropertiesFile.exists()) {
+            localPropertiesFile.inputStream().use { localProperties.load(it) }
         }
+
+        // 2. Extract the key from the loaded properties object
+        val geminiKey = localProperties.getProperty("GEMINI_API_KEY") ?: ""
+
+        // 3. Define the build config field so the app can see it
+        buildConfigField("String", "GEMINI_API_KEY", "\"$geminiKey\"")
 
         ndk {
             abiFilters += listOf("arm64-v8a", "armeabi-v7a")
@@ -96,6 +84,7 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.7")
+    implementation("androidx.compose.material:material-icons-extended")
 
     // CameraX
     val cameraVersion = "1.4.1"

@@ -303,8 +303,16 @@
   "sequence_length": 30,
   "num_features": 780,
   "num_raw_features": 258,
-  "model_version": "V3",
+  "model_version": "V3.1.6",
   "scaler_baked_in": true,
+  "multi_speed_trained": true,
+  "speed_tiers": [
+    "1x",
+    "1.5x",
+    "2x"
+  ],
+  "idle_prefix_augmented": false,
+  "zscore_fitted_on": "1x_speed_only",
   "architecture": "2x BiLSTM-128 + Dot Attention",
   "processing_pipeline": {
     "stages": [
@@ -316,6 +324,7 @@
       "Stage 6: Z-score (BAKED INTO MODEL ─ no external scaler needed!)"
     ],
     "note": "Apply stages 1-5 externally. Stage 6 is inside the TFLite model.",
-    "input_to_model": "(1, 30, 780) float32 ─ stages 1-5 applied, NO z-score needed"
+    "input_to_model": "(1, 30, 780) float32 ─ stages 1-5 applied, NO z-score needed",
+    "training_pipeline_order": "Split → Speed variants → Stages 1-5 → Augment → Z-score (fitted on 1× only)"
   }
 }
