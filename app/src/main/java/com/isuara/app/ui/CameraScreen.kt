@@ -71,14 +71,61 @@ fun CameraScreen(
 
     val mlExecutor = remember { Executors.newSingleThreadExecutor() }
 
+    // =========================================================================
+    // 1. AUTO-TRANSLATE & TTS FEATURE
+    // =========================================================================
+    LaunchedEffect(predictionState.currentWord) {
+        // Notice the new condition: !predictionState.isWaitingForNewSentence
+        // This prevents the TTS from looping twice if the user stays idle!
+        if (predictionState.currentWord == "Idle" &&
+            predictionState.sentence.isNotEmpty() &&
+            !isTranslating &&
+            !predictionState.isWaitingForNewSentence) {
+
+            kotlinx.coroutines.delay(2000)
+
+            val words = signPredictor.getSentenceWords()
+            if (words.isNotEmpty()) {
+                isTranslating = true
+                translatedText = ""
+
+                try {
+                    val result = geminiTranslator?.translate(words) ?: "Error: Gemini unavailable"
+                    translatedText = result
+
+                    val textToSpeak = result.ifEmpty { words.joinToString(" ") }
+                    if (textToSpeak.isNotEmpty()) {
+                        ttsService.speak(textToSpeak)
+                    }
+                } catch (e: Exception) {
+                    translatedText = "Translation failed"
+                    Log.e(TAG, "Auto-translate error", e)
+                } finally {
+                    isTranslating = false
+                    // INSTEAD OF resetAll(), tell the predictor to hold the text on
+                    // screen until the exact moment the next sign is made!
+                    signPredictor.prepareForNewSentence()
+                }
+            }
+        }
+    }
+
+    // =========================================================================
+    // 2. UI POLISH (OPTIONAL BUT RECOMMENDED)
+    // Clear the previous translation text from the screen when a NEW sentence starts
+    // =========================================================================
+    LaunchedEffect(predictionState.sentence.size) {
+        if (predictionState.sentence.size == 1 && !isTranslating) {
+            translatedText = ""
+        }
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
     ) {
-        // ══════════════════════════════════════════
-        // 1. EXACT 4:3 CAMERA PREVIEW (Top half)
-        // ══════════════════════════════════════════
+        // 1. EXACT 4:3 CAMERA PREVIEW
         Box(
             modifier = Modifier
                 .fillMaxWidth()
@@ -246,17 +293,14 @@ fun CameraScreen(
             )
         }
 
-        // ══════════════════════════════════════════
-        // 2. CENTERED UI PANEL (Bottom half)
-        // ══════════════════════════════════════════
+        // 2. CENTERED UI PANEL
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .weight(1f) // Takes up whatever space is left below the camera
+                .weight(1f)
                 .padding(16.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            // Live Tracking Prediction (Fixed Height)
             Box(modifier = Modifier.height(40.dp), contentAlignment = Alignment.Center) {
                 androidx.compose.animation.AnimatedVisibility(
                     visible = predictionState.currentWord.isNotEmpty(),
@@ -285,8 +329,6 @@ fun CameraScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // ── Emitted Sentence & Translation ──
-            // Notice the `weight(1f)` here. This locks the box to fill all remaining vertical space.
             val displaySentence = predictionState.sentence.joinToString(" ")
 
             Surface(
@@ -294,9 +336,8 @@ fun CameraScreen(
                 shape = RoundedCornerShape(12.dp),
                 modifier = Modifier
                     .fillMaxWidth()
-                    .weight(1f) // PREVENTS LAYOUT JUMPS
+                    .weight(1f)
             ) {
-                // We use verticalArrangement = Center so the text stays perfectly in the middle of the box
                 Column(
                     modifier = Modifier.padding(16.dp),
                     horizontalAlignment = Alignment.CenterHorizontally,
@@ -311,13 +352,12 @@ fun CameraScreen(
                         textAlign = TextAlign.Center
                     )
 
-                    // The translation appears smoothly inside the fixed box without expanding the screen
                     AnimatedVisibility(visible = isTranslating || translatedText.isNotEmpty()) {
                         Column(
                             modifier = Modifier.padding(top = 8.dp),
                             horizontalAlignment = Alignment.CenterHorizontally
                         ) {
-                            Divider(color = Color.White.copy(alpha = 0.2f), modifier = Modifier.padding(vertical = 8.dp))
+                            HorizontalDivider(color = Color.White.copy(alpha = 0.2f), modifier = Modifier.padding(vertical = 8.dp))
                             if (isTranslating) {
                                 Row(verticalAlignment = Alignment.CenterVertically) {
                                     CircularProgressIndicator(color = Color(0xFF2196F3), modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
@@ -341,7 +381,6 @@ fun CameraScreen(
 
             Spacer(modifier = Modifier.height(16.dp))
 
-            // ── Uniform Action Buttons (Pinned to the bottom) ──
             val uniformButtonHeight = 56.dp
 
             Row(
