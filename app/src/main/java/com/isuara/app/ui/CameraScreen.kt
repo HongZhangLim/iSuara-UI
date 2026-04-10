@@ -90,16 +90,28 @@ fun CameraScreen(
                 translatedText = ""
 
                 try {
-                    val result = geminiTranslator?.translate(words) ?: "Error: Gemini unavailable"
-                    translatedText = result
+                    val rawSentence = words.joinToString(" ")
+                    val result = geminiTranslator?.translate(words)
 
-                    val textToSpeak = result.ifEmpty { words.joinToString(" ") }
-                    if (textToSpeak.isNotEmpty()) {
-                        ttsService.speak(textToSpeak)
+                    // If Gemini succeeds but returns empty, or if translator catches an error
+                    translatedText = if (result.isNullOrBlank() ||
+                        result.contains("error", ignoreCase = true) ||
+                        result.contains("fail", ignoreCase = true)) {
+                        rawSentence
+                    } else {
+                        result
+                    }
+
+                    // Speak whatever text we ended up with
+                    if (translatedText.isNotEmpty()) {
+                        ttsService.speak(translatedText)
                     }
                 } catch (e: Exception) {
-                    translatedText = "Translation failed"
-                    Log.e(TAG, "Auto-translate error", e)
+                    // If Gemini crashes (e.g., no internet), fallback to raw words
+                    val rawSentence = words.joinToString(" ")
+                    translatedText = rawSentence
+                    ttsService.speak(rawSentence) // Still speak it out loud!
+                    Log.e(TAG, "Auto-translate error, falling back to raw text", e)
                 } finally {
                     isTranslating = false
                     // INSTEAD OF resetAll(), tell the predictor to hold the text on
@@ -408,8 +420,25 @@ fun CameraScreen(
                             isTranslating = true
                             translatedText = ""
                             scope.launch {
-                                translatedText = geminiTranslator?.translate(words) ?: "Error: Gemini unavailable"
-                                isTranslating = false
+                                try {
+                                    val result = geminiTranslator?.translate(words)
+                                    val rawSentence = words.joinToString(" ")
+
+                                    // Fallback if result is empty, null, or contains error/fail messages
+                                    translatedText = if (result.isNullOrBlank() ||
+                                        result.contains("error", ignoreCase = true) ||
+                                        result.contains("fail", ignoreCase = true)) {
+                                        rawSentence
+                                    } else {
+                                        result
+                                    }
+                                } catch (e: Exception) {
+                                    // Fallback on crash (e.g., no internet connection)
+                                    translatedText = words.joinToString(" ")
+                                    Log.e(TAG, "Manual translate error", e)
+                                } finally {
+                                    isTranslating = false
+                                }
                             }
                         }
                     },
