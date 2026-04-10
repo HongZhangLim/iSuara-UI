@@ -1,13 +1,13 @@
-# iSuara: Edge ML Sign Language Interpreter
+# iSuara: Offline ML Sign Language Interpreter
 
 ### 🚀 Try it Live
-[![Download APK](https://img.shields.io/badge/Download_APK_V3.1.5-iSuara-2ea44f?style=for-the-badge&logo=android)]([YOUR_COPIED_GITHUB_RELEASE_LINK_HERE](https://github.com/HongZhangLim/iSuara-UI/releases/download/Stable/iSuara_V3.1.5.apk))
+[![Download APK](https://img.shields.io/badge/Download_APK_V3.1.6-iSuara-2ea44f?style=for-the-badge&logo=android)]([YOUR_COPIED_GITHUB_RELEASE_LINK_HERE](https://github.com/HongZhangLim/iSuara/releases/download/v3.1.6/iSuara-v3.1.6.apk))
 
 *(Note: Ensure you allow "Install from unknown sources" on your Android device to install the prototype).*
 
 ## 1. Repository Overview & Team Introduction
 
-Welcome to the official repository for **iSuara**, an Edge-AI Android application built to provide real-time, pocket-sized translation of Bahasa Isyarat Malaysia (BIM) into spoken Malay. This repository contains the complete Android Studio project, including the native Kotlin UI, MediaPipe vision extractors, TensorFlow Lite inference pipeline, and Gemini API integration.
+Welcome to the official repository for **iSuara**, an Edge-AI Android application built to provide real-time, pocket-sized translation of Bahasa Isyarat Malaysia (BIM) into spoken Malay. This repository contains the complete Android Studio project, including the native Kotlin UI, MediaPipe vision extractors, LiteRT inference pipeline, and Gemini API integration.
 
 **Team Name:** sudo rm -rf /
 
@@ -25,9 +25,9 @@ In Malaysia, there are **44,000 Deaf and hard-of-hearing individuals**, but only
 
 iSuara is built to advance the United Nations Sustainable Development Goals:
 
+* **SDG 10 (Reduced Inequalities) - Target 10.2:** Promotes universal social and economic inclusion by giving the Deaf community an independent, real-time voice.
 * **SDG 4 (Quality Education) - Targets 4.5 & 4.a:** Empowers Deaf students to advocate for themselves and participate in inclusive learning environments.
 * **SDG 8 (Decent Work & Economic Growth) - Target 8.5:** Breaks workplace communication barriers, allowing seamless idea contribution and productive employment.
-* **SDG 10 (Reduced Inequalities) - Target 10.2:** Promotes universal social and economic inclusion by giving the Deaf community an independent, real-time voice.
 
 ### Short Description
 
@@ -48,11 +48,11 @@ iSuara is a real-time, native Android application that bridges the communication
 
 ### Google Technologies
 
-* **Android Studio & Kotlin Native:** The foundation of our zero-copy architecture, enabling direct access to camera hardware (CameraX) and the device's NPU without the bridge-latency of cross-platform frameworks.
-* **Google MediaPipe:** Handles hardware-parallelized skeletal extraction (Pose on GPU, Hands on CPU) to generate 258 dense keypoints per frame.
-* **TensorFlow Lite & Android NNAPI:** Runs our custom int8-quantized BiLSTM model locally on the Neural Processing Unit (NPU), taking only ~1-3ms per inference.
-* **Gemini 2.5 Flash Lite API:** Acts as our cloud-based semantic brain, transforming raw BIM glosses (e.g., "Market + I + Go") into natural sentences (e.g., "Saya pergi ke pasar") instantly.
-* **Google Text-to-Speech (TTS):** The native Android engine used to execute the final audio output.
+* **Android Studio & Kotlin Native:** The foundation of our zero-copy architecture, enabling direct access to camera hardware (CameraX) and the device's GPU without the bridge-latency of cross-platform frameworks.
+* **Google MediaPipe:** Handles hardware-parallelized skeletal extraction (Pose on GPU, Hands on CPU) of 75 keypoints per frame.
+* **Google LiteRT:** Runs our custom int8-quantized BiLSTM model locally, taking only ~1-3ms per inference.
+* **Gemini 3.1 Flash Lite API:** Acts as our cloud-based semantic brain, transforming raw BIM glosses (e.g., "Market + I + Go") into natural sentences (e.g., "Saya pergi ke pasar") instantly.
+* **Google Text-to-Speech (TTS):** The offline native Android TTS engine used to execute the final audio output.
 * **Google Colab:** Our primary environment for model training and evaluating quantitative analytics via Matplotlib.
 
 ### Other Supporting Tools
@@ -72,9 +72,9 @@ iSuara utilizes a **Decoupled Edge-Cloud Pipeline**. Heavy visual processing (tr
 
 1. **Capture:** CameraX captures 640x480 video at up to 60 FPS.
 2. **Extract:** MediaPipe hardware parallelism tracks body pose (GPU) and dynamically crops hand regions (CPU).
-3. **Normalize:** `FrameNormalizer` applies EMA smoothing and extracts 780 physical features (velocity/acceleration) over a 30-frame sliding window.
-4. **Predict:** TFLite BiLSTM model evaluates the temporal array to predict one of 98 BIM signs natively on the NPU.
-5. **Refine:** Gemini 2.5 Flash Lite restructures the buffered sign tokens into conversational SVO Malay.
+3. **Normalize:** `FrameNormalizer` applies EMA smoothing and engineered features (velocity/acceleration).
+4. **Predict:** BiLSTM model evaluates the temporal array to predict one of 98 BIM signs natively on the GPU.
+5. **Refine:** Gemini 3.1 Flash Lite restructures the buffered sign tokens into conversational SVO Malay.
 6. **Output:** The app displays the text via Compose UI and speaks it aloud via Android TTS.
 
 ---
@@ -83,7 +83,7 @@ iSuara utilizes a **Decoupled Edge-Cloud Pipeline**. Heavy visual processing (tr
 
 * **Challenge 1: Model Regression & Overheating**
 * *Problem:* We initially used a Transformer model. It was too heavy for mobile, causing overheating and dropping framerates to 10 FPS.
-* *Solution:* We pivoted to a **Bidirectional LSTM with Dot Attention**. This achieved the same sequence-understanding but is lightweight enough to run in ~3ms on the NPU, bumping our framerate to a smooth 35+ FPS.
+* *Solution:* We pivoted to a **Bidirectional LSTM with Dot Attention**. This achieved the same sequence-understanding but is lightweight enough to run in ~3ms on the GPU, bumping our framerate to a smooth 35+ FPS.
 
 
 * **Challenge 2: High Tracking Latency**
@@ -137,14 +137,3 @@ cd android
 6. Tap **Reset** to clear the current buffer.
 
 ---
-
-## 8. Future Roadmap
-
-To scale iSuara into a comprehensive accessibility platform, our roadmap is structured into three phases:
-
-* **Short-Term (0–6 Months): Localized Vocabulary Expansion**
-Expand the model from 98 to **300+ BIM signs**, targeting essential medical, legal, and emergency vocabulary. We will conduct pilot testing with Malaysian Deaf Associations and integrate an in-app misclassification reporting tool to fine-tune our BiLSTM model.
-* **Medium-Term (6–12 Months): B2G Integration & Two-Way Comm**
-Transition to a B2B/B2G model by developing an Enterprise Dashboard and deploying iSuara as fixed "Digital Interpreter Kiosks" at hospital and police counters. We will also implement **Two-Way Communication**, utilizing Gemini to convert spoken words from hearing officers back into text or visual BIM avatars.
-* **Long-Term (12+ Months): ASEAN Expansion & Technical Scaling**
-Retrain our physical feature pipeline to support regional languages like **BISINDO (Indonesia)** and **Thai Sign Language**. Architecturally, we plan to replace the MediaPipe bottleneck with a unified Vision Transformer (ViT) to achieve true device-agnostic hyperscaling on lower-tier Android devices. Finally, we will launch **Semantic Sign Search**, acting as the world's first real-time BIM-to-text dictionary.
